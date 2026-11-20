@@ -1,0 +1,22 @@
+# Never commit GIFA's runtime data: it holds Bilibili login cookies, watch history, ROI dumps
+data/
+Partitions/
+*.log
+
+# Build outputs / binaries
+*.asar
+*.asar.bak
+*.asar.unpacked/
+*.exe
+*.dll
+*.pak
+*.bin
+*.dat
+node_modules/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
