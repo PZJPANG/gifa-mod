@@ -160,6 +160,11 @@ function createWebview() {
       if (window.api.subtitleTracks) window.api.subtitleTracks(e.args && e.args[0]);
       return;
     }
+    // 视频角色定位：博主小地图的切片，转给主进程再交给叠加层（和你的游戏小地图比对）
+    if (e.channel === 'minimap-patch') {
+      if (window.api.minimapPatch) window.api.minimapPatch({ ...(e.args && e.args[0]), id: state.id });
+      return;
+    }
     if (e.channel === 'subtitle-live') {
       if (window.api.subtitleLive) window.api.subtitleLive(String((e.args && e.args[0]) || ''));
       return;
@@ -255,6 +260,8 @@ function syncBearingToGuest(extra) {
   sendPlayer({
     cmd: 'bearing',
     on: !!b.enabled,
+    // 视频角色定位（小地图上的点）：默认开
+    locate: b.locate !== false,
     rois: roisFor(state.id),
     ...(extra || {})
   });

@@ -301,7 +301,207 @@ function draw() {
     drawViewArc(cx, cy, r, v.shown, v.conf, v.width);
   }
   if (tween.arrow.shown !== null) drawArrow(cx, cy, r, tween.arrow.shown);
+  // 视频角色的位置点画在最上面：它是「去哪」，比方向更重要
+  if (locate.dot && !placing) drawLocateDot(cx, cy, r, locate.dot);
 }
+
+/* ------------------------------------------------------------ 视频角色位置 */
+
+/**
+ * 把视频里博主的小地图和「你屏幕上的小地图」做匹配，在你的小地图上画出博主所在的点。
+ * 匹配算法在 locate-core.js / locate-worker.js；这里只管截屏、裁剪、画点。
+ *
+ * 截屏会拍到本程序自己的窗口（这个红圈、弹幕、字幕……），主进程开启定位时给它们打了
+ * 「不参与截屏」的标记（Windows 的 WDA_EXCLUDEFROMCAPTURE），所以截到的只有游戏画面。
+ */
+const locate = {
+  enabled: false,
+  sourceId: '',
+  display: null,
+  stream: null,
+  video: null,
+  worker: null,
+  busy: false,
+  dot: null,
+  lastPatchAt: 0,
+  lastResult: null,
+  status: '',
+  tick: 0
+};
+
+// 博主小地图切片里，小地图半径 = patch.R 像素；dot 坐标单位相同（比例 1 下）
+const LOCATE_PATCH_R = 40;
+// 学习阶段最大会按 1.65 × 1.03 的比例去裁，截图要给够这么大一块
+const LOCATE_MAX_SCALE = 1.75;
+
+function setLocateStatus(s, extra) {
+  if (locate.status === s && !extra) return;
+  locate.status = s;
+  window.overlayApi.locateStatus({ status: s, ...(extra || {}) });
+}
+
+function drawLocateDot(cx, cy, r, dot) {
+  const ox = (dot.x / LOCATE_PATCH_R) * r;
+  const oy = (dot.y / LOCATE_PATCH_R) * r;
+  const dist = Math.hypot(ox, oy);
+  // 点在你小地图之外 = 你离博主太远（不在路线上），不画
+  if (dist > r * 0.97) return;
+  const dpr = window.devicePixelRatio || 1;
+  const x = cx + ox;
+  const y = cy + oy;
+  const size = clamp(r * 0.075, 4, 10);
+  ctx.save();
+  ctx.globalAlpha = dot.held ? 0.45 : 1;
+  // 从你（圆心外一点）到博主的一条细虚线：一眼看出「往哪走」
+  if (dist > size * 3) {
+    const ux = ox / dist;
+    const uy = oy / dist;
+    ctx.setLineDash([4, 5]);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(255, 214, 64, 0.7)';
+    ctx.beginPath();
+    ctx.moveTo(cx + ux * r * 0.18, cy + uy * r * 0.18);
+    ctx.lineTo(x - ux * size * 1.6, y - uy * size * 1.6);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // 点本身：金黄实心 + 白描边 + 暗投影，草地雪地都看得清
+  ctx.shadowColor = SHADOW;
+  ctx.shadowBlur = 6 * dpr;
+  ctx.beginPath();
+  ctx.arc(x, y, size, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffd640';
+  ctx.fill();
+  ctx.shadowColor = 'transparent';
+  ctx.lineWidth = Math.max(1.5, size * 0.32);
+  ctx.strokeStyle = WHITE;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function stopLocateCapture() {
+  if (locate.stream) for (const t of locate.stream.getTracks()) t.stop();
+  locate.stream = null;
+  if (locate.video) {
+    locate.video.srcObject = null;
+    locate.video = null;
+  }
+}
+
+async function startLocateCapture() {
+  stopLocateCapture();
+  if (!locate.sourceId) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: locate.sourceId, maxFrameRate: 6 } }
+    });
+    if (!locate.enabled) {
+      for (const t of stream.getTracks()) t.stop();
+      return;
+    }
+    const v = document.createElement('video');
+    v.muted = true;
+    v.srcObject = stream;
+    await v.play();
+    locate.stream = stream;
+    locate.video = v;
+    setLocateStatus('waiting');
+  } catch (err) {
+    setLocateStatus('error', { message: String((err && err.message) || err) });
+  }
+}
+
+function ensureWorker() {
+  if (locate.worker) return locate.worker;
+  const w = new Worker('./locate-worker.js');
+  w.onmessage = (e) => {
+    const m = e.data || {};
+    if (m.type === 'learned') {
+      window.overlayApi.locateLearned(m.scale);
+      return;
+    }
+    if (m.type !== 'result') return;
+    locate.busy = false;
+    locate.lastResult = m;
+    const had = !!locate.dot;
+    locate.dot = m.dot;
+    if (had || locate.dot) draw();
+    setLocateStatus(m.dot ? 'tracking' : m.locked ? 'searching' : 'learning', m.locked ? { scale: m.scale } : null);
+  };
+  w.onerror = (e) => {
+    locate.busy = false;
+    setLocateStatus('error', { message: e.message || 'worker error' });
+  };
+  locate.worker = w;
+  return w;
+}
+
+/** 视频小地图切片到了：截一块你小地图附近的屏幕，交给后台线程匹配（上一次没算完就丢掉这一帧） */
+async function onLocatePatch(patch) {
+  if (!locate.enabled || placing || !patch || !patch.gray) return;
+  locate.lastPatchAt = Date.now();
+  const v = locate.video;
+  const d = locate.display;
+  if (!v || !d || !v.videoWidth || locate.busy) return;
+  const k = v.videoWidth / d.width; // 截屏像素 / 屏幕逻辑像素
+  const ringR = radius(window.innerWidth, window.innerHeight);
+  const centre = {
+    x: (window.screenX + window.innerWidth / 2 - d.x) * k,
+    y: (window.screenY + window.innerHeight / 2 - d.y) * k
+  };
+  const ringRs = ringR * k;
+  const half = Math.ceil((64 / LOCATE_PATCH_R) * ringRs * LOCATE_MAX_SCALE);
+  const x0 = Math.max(0, Math.floor(centre.x - half));
+  const y0 = Math.max(0, Math.floor(centre.y - half));
+  const x1 = Math.min(v.videoWidth, Math.ceil(centre.x + half));
+  const y1 = Math.min(v.videoHeight, Math.ceil(centre.y + half));
+  if (x1 - x0 < 16 || y1 - y0 < 16) return;
+  locate.busy = true;
+  try {
+    const bitmap = await createImageBitmap(v, x0, y0, x1 - x0, y1 - y0);
+    ensureWorker().postMessage(
+      { type: 'frame', patch, bitmap, origin: { x: x0, y: y0 }, centre, ringR: ringRs, now: Date.now() },
+      [bitmap]
+    );
+  } catch (err) {
+    locate.busy = false;
+    setLocateStatus('error', { message: String((err && err.message) || err) });
+  }
+}
+
+window.overlayApi.onLocatePatch((p) => {
+  onLocatePatch(p);
+});
+
+window.overlayApi.onLocateConfig((c) => {
+  if (!c) return;
+  const was = locate.enabled;
+  const sourceChanged = c.sourceId !== locate.sourceId;
+  locate.enabled = !!c.enabled && !!c.sourceId;
+  locate.sourceId = c.sourceId || '';
+  locate.display = c.display || null;
+  if (c.reset || !was) {
+    ensureWorker().postMessage({ type: 'reset', savedScale: c.savedScale || 0 });
+    locate.dot = null;
+    draw();
+  }
+  if (!locate.enabled) {
+    stopLocateCapture();
+    locate.dot = null;
+    draw();
+    setLocateStatus(c.enabled ? 'error' : 'off', c.enabled ? { message: '找不到要截取的屏幕' } : null);
+    return;
+  }
+  if (sourceChanged || !locate.stream) startLocateCapture();
+});
+
+// 一段时间没有新切片（视频暂停、过场、没小地图）：让点按时消失，别挂一个过期的点
+setInterval(() => {
+  if (!locate.enabled || !locate.worker || locate.busy) return;
+  if (locate.dot && Date.now() - locate.lastPatchAt > 600) locate.worker.postMessage({ type: 'tick', now: Date.now() });
+  if (!locate.dot && locate.lastPatchAt && Date.now() - locate.lastPatchAt > 3000) setLocateStatus('waiting');
+}, 300);
 
 /** 视角有更新时续期，并在过期那一刻重绘一次把绿弧收掉 */
 let viewExpireTimer = 0;

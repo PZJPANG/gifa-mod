@@ -400,6 +400,7 @@ function fillSettings(settings) {
 
   const b = settings.bearing || {};
   $('setBearing').checked = !!b.enabled;
+  $('setLocate').checked = b.locate !== false;
   $('setBearingSize').value = String(b.radius ?? 110);
   $('sizeVal').textContent = String(b.radius ?? 110);
 
@@ -637,6 +638,23 @@ async function syncPlaceButton() {
   }
 }
 
+/** 位置点的实时状态（叠加层 → 主进程 → 这里） */
+function renderLocateState(s) {
+  if (!s) return;
+  const ratio = s.scale ? `（缩放 ×${s.scale.toFixed(2)}）` : '';
+  const text = !s.enabled
+    ? '把视频里的小地图和你的小地图比对，在你的小地图上用黄点标出博主站在哪；只有你跟在路线附近时才会出现'
+    : {
+        off: '已关闭',
+        waiting: '等视频播放、画面里出现小地图…',
+        learning: '正在学习博主小地图的缩放比例：跟着路线走几步，学好后自动出现黄点（这个视频只需学一次）',
+        searching: `比例已学好${ratio}，但你现在不在博主的路线附近`,
+        tracking: `正在跟踪${ratio}：黄点就是博主的位置`,
+        error: `截屏失败：${s.message || '未知错误'}`
+      }[s.status] || '准备中…';
+  $('locateStatus').textContent = text;
+}
+
 function wireBearing() {
   $('setBearing').addEventListener('change', async (e) => {
     const on = e.target.checked;
@@ -656,6 +674,13 @@ function wireBearing() {
     fillSettings(state.boot.settings);
     await syncPlaceButton();
   });
+
+  $('setLocate').addEventListener('change', (e) => {
+    window.api.save({ bearing: { locate: e.target.checked } });
+    if (e.target.checked && !state.boot.settings.bearing.enabled) toast('位置点要先打开「显示方位箭头」，并把红圈摆在你的小地图上', true);
+  });
+  window.api.onLocateState(renderLocateState);
+  window.api.locateState().then(renderLocateState).catch(() => {});
 
   $('setBearingSize').addEventListener('input', (e) => {
     const v = Number(e.target.value);

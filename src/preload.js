@@ -15,6 +15,10 @@ contextBridge.exposeInMainWorld('api', {
 
   // 方位标记：角度是高频数据，用单向 send 避免 invoke 的往返开销
   bearing: (payload) => ipcRenderer.send('overlay:bearing', payload),
+  // 视频角色定位：博主小地图切片（每秒约 4 次，单向 send）
+  minimapPatch: (payload) => ipcRenderer.send('locate:patch', payload),
+  locateState: () => ipcRenderer.invoke('locate:state'),
+  onLocateState: (cb) => ipcRenderer.on('locate:state', (_e, s) => cb(s)),
   overlayEnable: (on) => ipcRenderer.invoke('overlay:enable', on),
   // 不传参数即切换；传布尔值是幂等设置
   overlayPlace: (on) => ipcRenderer.invoke('overlay:place', on),

@@ -1570,6 +1570,10 @@ function tickBearing() {
 
   const now = Date.now();
 
+  // 记下这一帧「真的有小地图」的那块区域（和箭头用的是同一个圆心修正），视频角色定位要用
+  const mapRoi = best ? bestRoi : cyanBest >= MAP_CYAN_FRAC_MIN ? cyanRoi : null;
+  if (mapRoi) BEARING.mapSeen = { roi: mapRoi, tx, ty, at: now };
+
   /* 手动自动定心：只有用户点了「③ 自动定心」才跑；算准一次就停，不会自己重来。
    * 用本帧已经抓好、尚未被其他逻辑改写的大窗做尝试，不额外读视频。 */
   if (A && A.active) {
@@ -2496,11 +2500,18 @@ function setBearing(cfg = {}) {
     }
   }
 
+  // 视频角色定位：要不要往浮窗送小地图切片（叠加层拿它和你的游戏小地图比对）
+  if (typeof cfg.locate === 'boolean') BEARING.locate = cfg.locate;
+
   // 纯 dump 调用（只抓一帧比对，不动识别开关）
-  if (cfg.on === undefined) return;
+  if (cfg.on === undefined) {
+    syncLocatePatches();
+    return;
+  }
 
   const on = !!cfg.on;
   BEARING.enabled = on;
+  syncLocatePatches();
 
   if (on) {
     if (!BEARING.guard && !BEARING.rvfc) {
@@ -2520,6 +2531,86 @@ function setBearing(cfg = {}) {
   } else if (BEARING.guard || BEARING.rvfc || BEARING.timer) {
     stopBearingLoop();
     ipcRenderer.sendToHost('bearing', { ok: false });
+  }
+}
+
+/* -------------------------------------------- 视频角色定位：小地图切片 */
+
+/**
+ * 每 250ms 把「视频里博主的小地图」做成一张 128×128 的切片发给浮窗，
+ * 叠加层拿它和你游戏里的小地图做匹配，算出博主相对你站在哪。
+ *
+ * 切片约定（叠加层按同样的约定裁你的小地图）：
+ *   · 小地图圆心在切片正中，标定半径 = LOCATE_R 像素（切片半边 64 像素 = 1.6 倍半径）；
+ *   · 视频小地图贴着画面边缘时取不满，cover = 实际取到的半径（切片像素）；
+ *   · 灰度 + 「像图标的像素」标记（鲜艳彩色、纯白），图标在两边不一定一致，不参与匹配。
+ * 只在视频在播、且最近 0.8 秒内箭头识别确认过小地图在画面里时才发 —— 转场 / 过场 / 菜单不发。
+ */
+const LOCATE_N = 128;
+const LOCATE_R = 40;
+let locateTimer = 0;
+let locateCanvas = null;
+
+function syncLocatePatches() {
+  const want = !!(BEARING.enabled && BEARING.locate);
+  if (want && !locateTimer) locateTimer = setInterval(sendLocatePatch, 250);
+  else if (!want && locateTimer) {
+    clearInterval(locateTimer);
+    locateTimer = 0;
+  }
+}
+
+function sendLocatePatch() {
+  const m = BEARING.mapSeen;
+  if (!video || video.paused || !video.videoWidth || !m || Date.now() - m.at > 800) return;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const mapR = m.roi.r * vw;
+  const cx = m.roi.cx * vw + (m.tx || 0);
+  const cy = m.roi.cy * vh + (m.ty || 0);
+  const want = 1.6 * mapR; // 切片半边对应的视频像素
+  const half = Math.min(want, cx, vw - cx, cy, vh - cy);
+  if (half < 0.5 * mapR) return; // 小地图大半在画面外，不够比
+  const k = LOCATE_N / 2 / want; // 切片像素 / 视频像素
+  if (!locateCanvas) {
+    locateCanvas = document.createElement('canvas');
+    locateCanvas.width = LOCATE_N;
+    locateCanvas.height = LOCATE_N;
+  }
+  const ctx = locateCanvas.getContext('2d', { willReadFrequently: true });
+  let data;
+  try {
+    ctx.clearRect(0, 0, LOCATE_N, LOCATE_N);
+    const d = half * k;
+    ctx.drawImage(video, cx - half, cy - half, 2 * half, 2 * half, LOCATE_N / 2 - d, LOCATE_N / 2 - d, 2 * d, 2 * d);
+    data = ctx.getImageData(0, 0, LOCATE_N, LOCATE_N).data;
+  } catch {
+    return; // 画面跨域等原因读不到像素
+  }
+  const gray = new Uint8Array(LOCATE_N * LOCATE_N);
+  const skip = new Uint8Array(LOCATE_N * LOCATE_N);
+  for (let i = 0, p = 0; i < gray.length; i += 1, p += 4) {
+    const r = data[p];
+    const g = data[p + 1];
+    const b = data[p + 2];
+    const mx = Math.max(r, g, b);
+    const mn = Math.min(r, g, b);
+    gray[i] = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+    if ((mx > 150 && mx - mn > 0.45 * mx) || mn > 235) skip[i] = 1;
+  }
+  try {
+    ipcRenderer.sendToHost('minimap-patch', {
+      n: LOCATE_N,
+      R: LOCATE_R,
+      cover: Math.min(LOCATE_R, half * k),
+      gray,
+      skip,
+      vid: videoIdExact(),
+      p: partFromUrl(location.href) || 1,
+      at: Date.now()
+    });
+  } catch {
+    /* 页面正在卸载 */
   }
 }
 

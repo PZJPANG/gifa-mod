@@ -5,7 +5,7 @@
  * 职责：无边框置顶窗口、全局快捷键、B 站视频解析、设置持久化
  */
 
-const { app, BrowserWindow, globalShortcut, ipcMain, powerMonitor, powerSaveBlocker, screen, session, shell } = require('electron');
+const { app, BrowserWindow, desktopCapturer, globalShortcut, ipcMain, powerMonitor, powerSaveBlocker, screen, session, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { execFileSync, spawn } = require('node:child_process');
@@ -471,7 +471,11 @@ const DEFAULT_SETTINGS = {
     // 叠加层：圆环半径（屏幕像素）与圆心屏幕坐标
     radius: 110,
     x: null,
-    y: null
+    y: null,
+    // 视频角色定位：把博主的小地图和你屏幕上的小地图比对，在你的小地图上画出博主的位置点
+    locate: true,
+    // 每个视频学到的缩放比例（博主小地图 / 你的小地图），下次打开直接用，不用再学
+    locateScaleBy: {}
   },
   // 游戏内字幕：独立的透明置顶窗，位置 / 大小 / 字号都记住
   subtitle: {
@@ -804,6 +808,7 @@ function createWindow() {
   });
 
   applyPin();
+  applyCaptureProtection();
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
   // webview 里的 <video> 一旦走 HTML 全屏，它会铺满整个客户区并盖住我们自己的
@@ -1091,6 +1096,7 @@ function createOverlay() {
 
   overlayWin.setAlwaysOnTop(true, 'screen-saver');
   overlayWin.setIgnoreMouseEvents(true, { forward: true });
+  applyCaptureProtection();
 
   // 拖动后记住圆心，下次启动原地复活
   overlayWin.on('move', () => {
@@ -1101,6 +1107,8 @@ function createOverlay() {
     persist();
     // 红圈就摆在玩家的小地图上：弹幕的避让区跟着走
     pushDanmakuStyle();
+    // 拖到了另一块显示器上：换一个截屏源
+    if (locateEnabled() && overlayDisplay().id !== locateDisplayId) sendLocateConfig(false);
   });
 
   overlayWin.on('closed', () => {
@@ -1113,6 +1121,7 @@ function createOverlay() {
     if (!overlayWin || overlayWin.isDestroyed()) return;
     overlayWin.webContents.send('mode', overlayPlacing ? 'place' : 'lock');
     if (lastBearing) overlayWin.webContents.send('bearing', lastBearing);
+    sendLocateConfig(true);
   });
 
   return overlayWin;
@@ -1169,6 +1178,7 @@ function setBearingEnabled(on) {
 
   if (win && !win.isDestroyed()) win.webContents.send('bearing:state', settings.bearing);
   persist();
+  sendLocateConfig(true);
   return settings.bearing;
 }
 
@@ -1179,7 +1189,84 @@ function setOverlayRadius(r) {
   }
   persist();
   pushDanmakuStyle();
+  // 红圈大小变了，之前按视频学到的比例都是相对旧红圈的，作废重学
+  settings.bearing.locateScaleBy = {};
+  sendLocateConfig(true);
   return settings.bearing.radius;
+}
+
+/* -------------------------------------------------------- 视频角色定位 */
+
+/**
+ * 叠加层（就是摆在你小地图上的那个红圈窗口）负责截屏、匹配、画点；主进程负责：
+ *   · 选要截的屏幕（红圈所在的那块显示器）；
+ *   · 定位开着时，把本程序所有浮窗标成「不参与截屏」，免得红圈、弹幕、字幕被拍进去污染匹配；
+ *   · 把视频那边送来的小地图切片转给叠加层；
+ *   · 按视频保存学到的缩放比例。
+ */
+let locateKey = '';
+let locateDisplayId = null;
+let locateStatus = { status: 'off' };
+
+function locateEnabled() {
+  return !!(settings.bearing.enabled && settings.bearing.locate !== false);
+}
+
+function applyCaptureProtection() {
+  const on = locateEnabled();
+  for (const w of [overlayWin, subWin, dmWin, win]) {
+    if (!w || w.isDestroyed()) continue;
+    try {
+      // Windows 10 2004+：WDA_EXCLUDEFROMCAPTURE，窗口照常显示，只是截屏 / 录屏里看不到
+      w.setContentProtection(on);
+    } catch {
+      /* 平台不支持 */
+    }
+  }
+}
+
+function overlayDisplay() {
+  if (!overlayWin || overlayWin.isDestroyed()) return screen.getPrimaryDisplay();
+  const b = overlayWin.getBounds();
+  return screen.getDisplayNearestPoint({ x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2) });
+}
+
+async function sendLocateConfig(reset) {
+  applyCaptureProtection();
+  if (!overlayWin || overlayWin.isDestroyed() || overlayWin.webContents.isLoading()) return;
+  if (!locateEnabled()) {
+    overlayWin.webContents.send('locate:config', { enabled: false });
+    return;
+  }
+  const d = overlayDisplay();
+  let sourceId = '';
+  try {
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
+    const hit = sources.find((s) => String(s.display_id) === String(d.id)) || sources[0];
+    sourceId = hit ? hit.id : '';
+  } catch (err) {
+    console.warn('[locate] 枚举屏幕失败：', err.message);
+  }
+  locateDisplayId = d.id;
+  if (!overlayWin || overlayWin.isDestroyed()) return;
+  const by = settings.bearing.locateScaleBy || {};
+  overlayWin.webContents.send('locate:config', {
+    enabled: true,
+    sourceId,
+    display: d.bounds,
+    savedScale: (locateKey && by[locateKey]) || 0,
+    reset: !!reset
+  });
+}
+
+function setLocateEnabled(on) {
+  settings.bearing.locate = !!on;
+  persist();
+  sendLocateConfig(true);
+  if (!on) {
+    locateStatus = { status: 'off' };
+    sendTo(consoleWin, 'locate:state', { ...locateStatus, enabled: false });
+  }
 }
 
 /* ------------------------------------------------------------ 游戏内字幕 */
@@ -1295,6 +1382,7 @@ function createSubtitleWindow() {
   subWin.setAlwaysOnTop(true, 'screen-saver');
   subWin.setIgnoreMouseEvents(!subEditing);
   subWin.setFocusable(subEditing);
+  applyCaptureProtection();
 
   const remember = () => {
     if (!subWin || subWin.isDestroyed()) return;
@@ -1796,6 +1884,7 @@ function createDanmakuWindow() {
   dmWin.setAlwaysOnTop(true, 'screen-saver');
   // 永远穿透：弹幕层盖满整个屏幕，绝不能吃掉游戏的鼠标
   dmWin.setIgnoreMouseEvents(true);
+  applyCaptureProtection();
   dmWin.on('closed', () => {
     dmWin = null;
   });
@@ -2280,6 +2369,34 @@ function registerIpc() {
 
   ipcMain.handle('overlay:enable', (_e, on) => setBearingEnabled(on));
 
+  /* ---- 视频角色定位 ---- */
+
+  // 浮窗页面送来的博主小地图切片：换视频了先让叠加层重置（带上这个视频之前学到的比例），再转过去
+  ipcMain.on('locate:patch', (event, p) => {
+    if (!win || win.isDestroyed() || event.sender !== win.webContents) return;
+    if (!locateEnabled() || !p || !p.gray || !overlayWin || overlayWin.isDestroyed()) return;
+    const key = String(p.id || p.vid || '');
+    if (key !== locateKey) {
+      locateKey = key;
+      sendLocateConfig(true);
+      return;
+    }
+    overlayWin.webContents.send('locate:patch', p);
+  });
+  // 叠加层第一次锁定了这个视频的缩放比例：存下来，下次打开这个视频直接用
+  ipcMain.on('locate:learned', (event, scale) => {
+    if (!overlayWin || overlayWin.isDestroyed() || event.sender !== overlayWin.webContents) return;
+    if (!locateKey || !Number.isFinite(scale) || scale < 0.3 || scale > 3) return;
+    settings.bearing.locateScaleBy = { ...(settings.bearing.locateScaleBy || {}), [locateKey]: Math.round(scale * 1000) / 1000 };
+    persist();
+  });
+  ipcMain.on('locate:status', (event, s) => {
+    if (!overlayWin || overlayWin.isDestroyed() || event.sender !== overlayWin.webContents || !s) return;
+    locateStatus = { status: String(s.status || ''), scale: Number(s.scale) || 0, message: String(s.message || '').slice(0, 200) };
+    sendTo(consoleWin, 'locate:state', { ...locateStatus, enabled: locateEnabled() });
+  });
+  ipcMain.handle('locate:state', () => ({ ...locateStatus, enabled: locateEnabled() }));
+
   /**
    * 手动自动定心的结果。访客算出的 dx/dy 是「视频像素」，这里换算成归一化偏移，
    * 直接写进该视频的标定（roiBy[id] 优先，否则全局 rois）——这就是「固定住」：
@@ -2440,6 +2557,12 @@ function registerIpc() {
     if (patch.bearing) {
       const b = patch.bearing;
       if (b.calibrated !== undefined) settings.bearing.calibrated = !!b.calibrated;
+      if (typeof b.locate === 'boolean') setLocateEnabled(b.locate);
+      // 视频里的小地图重新框过：这个视频之前学到的缩放比例作废
+      if (Array.isArray(b.rois) && b.videoId && settings.bearing.locateScaleBy) {
+        delete settings.bearing.locateScaleBy[b.videoId];
+        if (b.videoId === locateKey) sendLocateConfig(true);
+      }
 
       if (Array.isArray(b.rois)) {
         const rois = dropLegacySeeds(b.rois).slice(0, 4);
