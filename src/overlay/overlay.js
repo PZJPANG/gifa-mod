@@ -326,6 +326,7 @@ const locate = {
   lastPatchAt: 0,
   lastResult: null,
   status: '',
+  captureError: '',
   tick: 0,
   // 诊断计数（每 2 秒上报一次，写进 data\locate-debug.log）
   diag: { patchesIn: 0, noCapture: 0, busy: 0, framesOut: 0, results: 0, lastMs: 0, maxMs: 0, error: '' }
@@ -390,27 +391,84 @@ function stopLocateCapture() {
   }
 }
 
+/**
+ * 截屏。Electron 新版本的正规做法是 getDisplayMedia()：由主进程的 setDisplayMediaRequestHandler
+ * 直接指定截哪块屏（不弹系统选择框）。旧的 getUserMedia({ chromeMediaSource: 'desktop' })
+ * 在用户机器上实测起不来（日志里 capture 一直是 none），只留作兜底。
+ * 失败原因记进 locate.captureError，一直带在诊断日志里，不会被后面的「等待中」盖掉。
+ */
 async function startLocateCapture() {
+  if (locate.starting) return;
+  locate.starting = true;
+  try {
+    await startLocateCaptureInner();
+  } finally {
+    locate.starting = false;
+  }
+}
+
+/**
+ * getDisplayMedia() 要求「用户刚操作过」（点击等）。这个窗口鼠标穿透、永远点不到，
+ * 所以由主进程用 executeJavaScript(…, userGesture = true) 来调用它（带着手势）。
+ */
+window.__gifaStartCapture = () => {
+  if (!locate.enabled) return false;
+  if (locate.stream && !locate.needRestart) return true;
+  locate.needRestart = false;
+  startLocateCapture();
+  return true;
+};
+
+async function startLocateCaptureInner() {
   stopLocateCapture();
   if (!locate.sourceId) return;
+  const errs = [];
+  let stream = null;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: locate.sourceId, maxFrameRate: 6 } }
-    });
-    if (!locate.enabled) {
-      for (const t of stream.getTracks()) t.stop();
-      return;
+    stream = await navigator.mediaDevices.getDisplayMedia({ audio: false, video: { frameRate: { ideal: 6, max: 10 } } });
+  } catch (err) {
+    errs.push(`getDisplayMedia: ${(err && (err.name || err.message)) || err}`);
+  }
+  if (!stream) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: locate.sourceId, maxFrameRate: 6 } }
+      });
+    } catch (err) {
+      errs.push(`getUserMedia: ${(err && (err.name || err.message)) || err}`);
     }
+  }
+  if (!stream) {
+    locate.captureError = errs.join(' | ') || 'unknown';
+    setLocateStatus('error', { message: locate.captureError });
+    return;
+  }
+  if (!locate.enabled) {
+    for (const t of stream.getTracks()) t.stop();
+    return;
+  }
+  try {
     const v = document.createElement('video');
     v.muted = true;
     v.srcObject = stream;
     await v.play();
     locate.stream = stream;
     locate.video = v;
+    locate.captureError = '';
+    // 截屏流意外结束（显示器断开、系统回收）：记下来，下次配置时重开
+    for (const t of stream.getVideoTracks()) {
+      t.addEventListener('ended', () => {
+        locate.captureError = 'capture ended';
+        stopLocateCapture();
+        setLocateStatus('error', { message: '截屏被中断' });
+      });
+    }
     setLocateStatus('waiting');
   } catch (err) {
-    setLocateStatus('error', { message: String((err && err.message) || err) });
+    for (const t of stream.getTracks()) t.stop();
+    locate.captureError = `play: ${(err && (err.name || err.message)) || err}`;
+    setLocateStatus('error', { message: locate.captureError });
   }
 }
 
@@ -488,6 +546,7 @@ setInterval(() => {
     ...locate.diag,
     enabled: locate.enabled,
     capture: v ? `${v.videoWidth}x${v.videoHeight}` : 'none',
+    captureError: locate.captureError || '',
     display: locate.display ? `${locate.display.width}x${locate.display.height}@${locate.display.x},${locate.display.y}` : 'none',
     win: `${window.screenX},${window.screenY} ${window.innerWidth}x${window.innerHeight}`,
     status: locate.status,
@@ -522,14 +581,24 @@ window.overlayApi.onLocateConfig((c) => {
     setLocateStatus(c.enabled ? 'error' : 'off', c.enabled ? { message: '找不到要截取的屏幕' } : null);
     return;
   }
-  if (sourceChanged || !locate.stream) startLocateCapture();
+  // 截屏由主进程带着「用户手势」来启动（见 __gifaStartCapture）；3 秒内没起来再自己试一次兜底
+  if (sourceChanged || !locate.stream) {
+    locate.needRestart = true;
+    setTimeout(() => {
+      if (locate.enabled && (!locate.stream || locate.needRestart) && !locate.starting) {
+        locate.needRestart = false;
+        startLocateCapture();
+      }
+    }, 3000);
+  }
 });
 
 // 一段时间没有新切片（视频暂停、过场、没小地图）：让点按时消失，别挂一个过期的点
 setInterval(() => {
   if (!locate.enabled || !locate.worker || locate.busy) return;
   if (locate.dot && Date.now() - locate.lastPatchAt > 600) locate.worker.postMessage({ type: 'tick', now: Date.now() });
-  if (!locate.dot && locate.lastPatchAt && Date.now() - locate.lastPatchAt > 3000) setLocateStatus('waiting');
+  // 截屏本身失败时保持「错误」状态，不要用「等待中」把它盖掉
+  if (!locate.dot && !locate.captureError && locate.lastPatchAt && Date.now() - locate.lastPatchAt > 3000) setLocateStatus('waiting');
 }, 300);
 
 /** 视角有更新时续期，并在过期那一刻重绘一次把绿弧收掉 */

@@ -1206,7 +1206,36 @@ function setOverlayRadius(r) {
  */
 let locateKey = '';
 let locateDisplayId = null;
+let locateSourceId = '';
 let locateStatus = { status: 'off' };
+
+/**
+ * 叠加层调用 getDisplayMedia() 时由这里决定截哪块屏（不弹系统选择框）。
+ * 只答应叠加层自己的请求；别的页面（包括 B 站页面所在的分区本来就不是这个 session）一律拒绝。
+ */
+function installDisplayMediaHandler() {
+  session.defaultSession.setDisplayMediaRequestHandler(
+    async (request, callback) => {
+      try {
+        const f = request && request.frame;
+        const main = overlayWin && !overlayWin.isDestroyed() ? overlayWin.webContents.mainFrame : null;
+        const fromOverlay = !!(f && main && f.processId === main.processId && f.routingId === main.routingId);
+        if (!fromOverlay || !locateEnabled()) return callback({});
+        const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
+        const d = overlayDisplay();
+        const pick =
+          sources.find((s) => s.id === locateSourceId) ||
+          sources.find((s) => String(s.display_id) === String(d.id)) ||
+          sources[0];
+        callback(pick ? { video: pick } : {});
+      } catch (err) {
+        console.warn('[locate] 选择截屏源失败：', err.message);
+        callback({});
+      }
+    },
+    { useSystemPicker: false }
+  );
+}
 
 function locateEnabled() {
   return !!(settings.bearing.enabled && settings.bearing.locate !== false);
@@ -1248,6 +1277,7 @@ async function sendLocateConfig(reset) {
     console.warn('[locate] 枚举屏幕失败：', err.message);
   }
   locateDisplayId = d.id;
+  locateSourceId = sourceId;
   if (!overlayWin || overlayWin.isDestroyed()) return;
   const by = settings.bearing.locateScaleBy || {};
   overlayWin.webContents.send('locate:config', {
@@ -1257,7 +1287,28 @@ async function sendLocateConfig(reset) {
     savedScale: (locateKey && by[locateKey]) || 0,
     reset: !!reset
   });
+  startOverlayCapture();
 }
+
+/**
+ * 以「用户手势」身份让叠加层开始截屏：getDisplayMedia() 没有手势会被拒绝，
+ * 而叠加层鼠标穿透、永远收不到点击。executeJavaScript 的第二个参数 true 就是带手势执行。
+ */
+function startOverlayCapture() {
+  if (!overlayWin || overlayWin.isDestroyed() || overlayWin.webContents.isLoading()) return;
+  // 让配置消息先到（同一条 IPC 通道是有序的，但 executeJavaScript 走另一条路，稍等一下）
+  setTimeout(() => {
+    if (!overlayWin || overlayWin.isDestroyed()) return;
+    overlayWin.webContents
+      .executeJavaScript('typeof window.__gifaStartCapture === "function" && window.__gifaStartCapture()', true)
+      .catch((err) => console.warn('[locate] 启动截屏失败：', err.message));
+  }, 300);
+}
+
+// 截屏失败（比如显示器刚切换、第一次被拒绝）时每 15 秒带手势重试一次
+setInterval(() => {
+  if (locateEnabled() && locateStatus.status === 'error') startOverlayCapture();
+}, 15000);
 
 /**
  * 诊断日志：data\locate-debug.log，每 2 秒一行 JSON，把三段链路放在一起：
@@ -1277,6 +1328,7 @@ function writeLocateLog(videoDiag) {
     key: locateKey,
     savedScale: (settings.bearing.locateScaleBy || {})[locateKey] || 0,
     status: locateStatus.status,
+    statusMessage: locateStatus.message || '',
     video: videoDiag,
     main: { fromVideo: locateDbg.fromVideo, forwarded: locateDbg.forwarded, drop: locateDbg.drop },
     overlayDiag: locateDbg.overlay
@@ -2865,6 +2917,7 @@ if (!gotLock) {
       /* ignore */
     }
     registerIpc();
+    installDisplayMediaHandler();
     createConsole(); // 先出启动器，配置好了再点「启动跟跑」
     registerHotkeys();
 
