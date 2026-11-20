@@ -309,33 +309,26 @@ function draw() {
 
 /**
  * 把视频里博主的小地图和「你屏幕上的小地图」做匹配，在你的小地图上画出博主所在的点。
- * 匹配算法在 locate-core.js / locate-worker.js；这里只管截屏、裁剪、画点。
+ * 匹配算法在 locate-core.js / locate-worker.js；这里只管把数据交给后台线程、画点。
  *
- * 截屏会拍到本程序自己的窗口（这个红圈、弹幕、字幕……），主进程开启定位时给它们打了
- * 「不参与截屏」的标记（Windows 的 WDA_EXCLUDEFROMCAPTURE），所以截到的只有游戏画面。
+ * 截屏在主进程里做（screen-grab.js，GDI 复制小地图周围一小块）：Chromium 自带的截屏
+ * 在用户机器上报 NotReadableError。主进程开启定位时给本程序所有浮窗打了「不参与截屏」标记，
+ * 所以截到的只有游戏画面，不会把这个红圈自己拍进去。
  */
 const locate = {
   enabled: false,
-  sourceId: '',
-  display: null,
-  stream: null,
-  video: null,
   worker: null,
   busy: false,
   dot: null,
   lastPatchAt: 0,
   lastResult: null,
   status: '',
-  captureError: '',
-  tick: 0,
   // 诊断计数（每 2 秒上报一次，写进 data\locate-debug.log）
-  diag: { patchesIn: 0, noCapture: 0, busy: 0, framesOut: 0, results: 0, lastMs: 0, maxMs: 0, error: '' }
+  diag: { patchesIn: 0, busy: 0, framesOut: 0, results: 0, lastMs: 0, maxMs: 0, error: '' }
 };
 
 // 博主小地图切片里，小地图半径 = patch.R 像素；dot 坐标单位相同（比例 1 下）
 const LOCATE_PATCH_R = 40;
-// 学习阶段最大会按 1.65 × 1.03 的比例去裁，截图要给够这么大一块
-const LOCATE_MAX_SCALE = 1.75;
 
 function setLocateStatus(s, extra) {
   if (locate.status === s && !extra) return;
@@ -382,96 +375,6 @@ function drawLocateDot(cx, cy, r, dot) {
   ctx.restore();
 }
 
-function stopLocateCapture() {
-  if (locate.stream) for (const t of locate.stream.getTracks()) t.stop();
-  locate.stream = null;
-  if (locate.video) {
-    locate.video.srcObject = null;
-    locate.video = null;
-  }
-}
-
-/**
- * 截屏。Electron 新版本的正规做法是 getDisplayMedia()：由主进程的 setDisplayMediaRequestHandler
- * 直接指定截哪块屏（不弹系统选择框）。旧的 getUserMedia({ chromeMediaSource: 'desktop' })
- * 在用户机器上实测起不来（日志里 capture 一直是 none），只留作兜底。
- * 失败原因记进 locate.captureError，一直带在诊断日志里，不会被后面的「等待中」盖掉。
- */
-async function startLocateCapture() {
-  if (locate.starting) return;
-  locate.starting = true;
-  try {
-    await startLocateCaptureInner();
-  } finally {
-    locate.starting = false;
-  }
-}
-
-/**
- * getDisplayMedia() 要求「用户刚操作过」（点击等）。这个窗口鼠标穿透、永远点不到，
- * 所以由主进程用 executeJavaScript(…, userGesture = true) 来调用它（带着手势）。
- */
-window.__gifaStartCapture = () => {
-  if (!locate.enabled) return false;
-  if (locate.stream && !locate.needRestart) return true;
-  locate.needRestart = false;
-  startLocateCapture();
-  return true;
-};
-
-async function startLocateCaptureInner() {
-  stopLocateCapture();
-  if (!locate.sourceId) return;
-  const errs = [];
-  let stream = null;
-  try {
-    stream = await navigator.mediaDevices.getDisplayMedia({ audio: false, video: { frameRate: { ideal: 6, max: 10 } } });
-  } catch (err) {
-    errs.push(`getDisplayMedia: ${(err && (err.name || err.message)) || err}`);
-  }
-  if (!stream) {
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: locate.sourceId, maxFrameRate: 6 } }
-      });
-    } catch (err) {
-      errs.push(`getUserMedia: ${(err && (err.name || err.message)) || err}`);
-    }
-  }
-  if (!stream) {
-    locate.captureError = errs.join(' | ') || 'unknown';
-    setLocateStatus('error', { message: locate.captureError });
-    return;
-  }
-  if (!locate.enabled) {
-    for (const t of stream.getTracks()) t.stop();
-    return;
-  }
-  try {
-    const v = document.createElement('video');
-    v.muted = true;
-    v.srcObject = stream;
-    await v.play();
-    locate.stream = stream;
-    locate.video = v;
-    locate.captureError = '';
-    // 截屏流意外结束（显示器断开、系统回收）：记下来，下次配置时重开
-    for (const t of stream.getVideoTracks()) {
-      t.addEventListener('ended', () => {
-        locate.captureError = 'capture ended';
-        stopLocateCapture();
-        setLocateStatus('error', { message: '截屏被中断' });
-      });
-    }
-    setLocateStatus('waiting');
-  } catch (err) {
-    for (const t of stream.getTracks()) t.stop();
-    locate.captureError = `play: ${(err && (err.name || err.message)) || err}`;
-    setLocateStatus('error', { message: locate.captureError });
-  }
-}
-
 function ensureWorker() {
   if (locate.worker) return locate.worker;
   const w = new Worker('./locate-worker.js');
@@ -495,43 +398,45 @@ function ensureWorker() {
   w.onerror = (e) => {
     locate.busy = false;
     locate.diag.error = `worker: ${e.message || 'error'}`;
-    setLocateStatus('error', { message: e.message || 'worker error' });
+    setLocateStatus('error', { message: `worker: ${e.message || 'error'}` });
   };
   locate.worker = w;
   return w;
 }
 
-/** 视频小地图切片到了：截一块你小地图附近的屏幕，交给后台线程匹配（上一次没算完就丢掉这一帧） */
-async function onLocatePatch(patch) {
-  if (!locate.enabled || placing || !patch || !patch.gray) return;
+/**
+ * 主进程送来：视频小地图切片 + 你小地图周围的截图（GDI，BGRA，屏幕物理像素）。
+ * 转成 ImageBitmap 交给后台线程（上一次没算完就丢掉这一帧）。
+ */
+async function onLocatePatch(msg) {
+  if (!locate.enabled || placing || !msg || !msg.patch || !msg.frame) return;
   locate.lastPatchAt = Date.now();
   locate.diag.patchesIn += 1;
-  const v = locate.video;
-  const d = locate.display;
-  if (!v || !d || !v.videoWidth) return void (locate.diag.noCapture += 1);
   if (locate.busy) return void (locate.diag.busy += 1);
-  const k = v.videoWidth / d.width; // 截屏像素 / 屏幕逻辑像素
-  const ringR = radius(window.innerWidth, window.innerHeight);
-  const centre = {
-    x: (window.screenX + window.innerWidth / 2 - d.x) * k,
-    y: (window.screenY + window.innerHeight / 2 - d.y) * k
-  };
-  const ringRs = ringR * k;
-  const half = Math.ceil((64 / LOCATE_PATCH_R) * ringRs * LOCATE_MAX_SCALE);
-  const x0 = Math.max(0, Math.floor(centre.x - half));
-  const y0 = Math.max(0, Math.floor(centre.y - half));
-  const x1 = Math.min(v.videoWidth, Math.ceil(centre.x + half));
-  const y1 = Math.min(v.videoHeight, Math.ceil(centre.y + half));
-  if (x1 - x0 < 16 || y1 - y0 < 16) return;
+  const f = msg.frame;
+  const src = f.data;
+  if (!src || src.length < f.stride * f.h) return void (locate.diag.error = 'short frame');
   locate.busy = true;
   try {
-    const bitmap = await createImageBitmap(v, x0, y0, x1 - x0, y1 - y0);
+    // BGRA（可能带行尾填充）→ RGBA
+    const rgba = new Uint8ClampedArray(f.w * f.h * 4);
+    for (let y = 0; y < f.h; y += 1) {
+      let s = y * f.stride;
+      let d = y * f.w * 4;
+      for (let x = 0; x < f.w; x += 1, s += 4, d += 4) {
+        rgba[d] = src[s + 2];
+        rgba[d + 1] = src[s + 1];
+        rgba[d + 2] = src[s];
+        rgba[d + 3] = 255;
+      }
+    }
+    const bitmap = await createImageBitmap(new ImageData(rgba, f.w, f.h));
     ensureWorker().postMessage(
-      { type: 'frame', patch, bitmap, origin: { x: x0, y: y0 }, centre, ringR: ringRs, now: Date.now() },
+      { type: 'frame', patch: msg.patch, bitmap, origin: f.origin, centre: f.centre, ringR: f.ringR, now: Date.now() },
       [bitmap]
     );
     locate.diag.framesOut += 1;
-    locate.diag.geom = `ring ${ringRs.toFixed(0)}px @${centre.x.toFixed(0)},${centre.y.toFixed(0)} crop ${x1 - x0}x${y1 - y0}`;
+    locate.diag.geom = `ring ${Number(f.ringR).toFixed(0)}px @${f.centre.x},${f.centre.y} crop ${f.w}x${f.h}@${f.origin.x},${f.origin.y}`;
   } catch (err) {
     locate.busy = false;
     locate.diag.error = String((err && err.message) || err);
@@ -541,13 +446,9 @@ async function onLocatePatch(patch) {
 
 setInterval(() => {
   if (!locate.enabled && !locate.diag.patchesIn) return;
-  const v = locate.video;
   window.overlayApi.locateDiag({
     ...locate.diag,
     enabled: locate.enabled,
-    capture: v ? `${v.videoWidth}x${v.videoHeight}` : 'none',
-    captureError: locate.captureError || '',
-    display: locate.display ? `${locate.display.width}x${locate.display.height}@${locate.display.x},${locate.display.y}` : 'none',
     win: `${window.screenX},${window.screenY} ${window.innerWidth}x${window.innerHeight}`,
     status: locate.status,
     locked: !!(locate.lastResult && locate.lastResult.locked),
@@ -555,50 +456,36 @@ setInterval(() => {
     trusted: !!(locate.lastResult && locate.lastResult.trusted),
     dot: !!locate.dot
   });
-  locate.diag = { patchesIn: 0, noCapture: 0, busy: 0, framesOut: 0, results: 0, lastMs: 0, maxMs: 0, error: '' };
+  locate.diag = { patchesIn: 0, busy: 0, framesOut: 0, results: 0, lastMs: 0, maxMs: 0, error: '' };
 }, 2000);
 
-window.overlayApi.onLocatePatch((p) => {
-  onLocatePatch(p);
+window.overlayApi.onLocatePatch((m) => {
+  onLocatePatch(m);
 });
 
 window.overlayApi.onLocateConfig((c) => {
   if (!c) return;
   const was = locate.enabled;
-  const sourceChanged = c.sourceId !== locate.sourceId;
-  locate.enabled = !!c.enabled && !!c.sourceId;
-  locate.sourceId = c.sourceId || '';
-  locate.display = c.display || null;
+  locate.enabled = !!c.enabled;
   if (c.reset || !was) {
     ensureWorker().postMessage({ type: 'reset', savedScale: c.savedScale || 0 });
     locate.dot = null;
     draw();
   }
   if (!locate.enabled) {
-    stopLocateCapture();
     locate.dot = null;
     draw();
-    setLocateStatus(c.enabled ? 'error' : 'off', c.enabled ? { message: '找不到要截取的屏幕' } : null);
+    setLocateStatus('off');
     return;
   }
-  // 截屏由主进程带着「用户手势」来启动（见 __gifaStartCapture）；3 秒内没起来再自己试一次兜底
-  if (sourceChanged || !locate.stream) {
-    locate.needRestart = true;
-    setTimeout(() => {
-      if (locate.enabled && (!locate.stream || locate.needRestart) && !locate.starting) {
-        locate.needRestart = false;
-        startLocateCapture();
-      }
-    }, 3000);
-  }
+  if (!was) setLocateStatus('waiting');
 });
 
 // 一段时间没有新切片（视频暂停、过场、没小地图）：让点按时消失，别挂一个过期的点
 setInterval(() => {
   if (!locate.enabled || !locate.worker || locate.busy) return;
   if (locate.dot && Date.now() - locate.lastPatchAt > 600) locate.worker.postMessage({ type: 'tick', now: Date.now() });
-  // 截屏本身失败时保持「错误」状态，不要用「等待中」把它盖掉
-  if (!locate.dot && !locate.captureError && locate.lastPatchAt && Date.now() - locate.lastPatchAt > 3000) setLocateStatus('waiting');
+  if (!locate.dot && locate.status !== 'error' && locate.lastPatchAt && Date.now() - locate.lastPatchAt > 3000) setLocateStatus('waiting');
 }, 300);
 
 /** 视角有更新时续期，并在过期那一刻重绘一次把绿弧收掉 */

@@ -23,9 +23,12 @@ everything after it is a modification, so `git diff <first commit>` shows exactl
 The video's minimap and your minimap are both north-up, so they differ only by zoom and shift.
 - **Video side** (`src/webview-preload.js`): ~4×/s, a 128×128 grayscale patch of the video minimap (the region the
   direction tracker confirmed), with icon-like pixels (saturated colours, pure white) flagged.
-- **Game side** (`src/overlay/*`): the red-ring window captures the screen around your minimap. While this is on, all GIFA
-  windows are marked *excluded from capture* (Windows `WDA_EXCLUDEFROMCAPTURE`), so the ring / danmaku / subtitles
-  never pollute it — side effect: they also don't appear in your own screenshots or recordings.
+- **Game side** (`src/screen-grab.js`, `src/overlay/*`): the main process captures a small square around your minimap
+  (where the red ring sits) with GDI `BitBlt` via a long-running PowerShell helper (~20 ms per 500×500 grab).
+  Chromium's own capture (`getDisplayMedia` / desktop `getUserMedia`) failed with `NotReadableError` on a hybrid-GPU
+  laptop running elevated, GDI doesn't depend on that path. While this is on, all GIFA windows are marked
+  *excluded from capture* (Windows `WDA_EXCLUDEFROMCAPTURE`), so the ring / danmaku / subtitles never pollute it —
+  side effect: they also don't appear in your own screenshots or recordings.
 - **Matching** (`src/overlay/locate-core.js`, in a Web Worker): Sobel edge images, ring window with the player-arrow
   centre and icons removed, then **masked normalized cross-correlation** (Padfield, FFT-based) over all shifts.
   The zoom ratio is unknown (uploaders often show an enlarged map overlay), so it's searched coarse-to-fine over

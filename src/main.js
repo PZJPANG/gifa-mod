@@ -5,7 +5,7 @@
  * 职责：无边框置顶窗口、全局快捷键、B 站视频解析、设置持久化
  */
 
-const { app, BrowserWindow, desktopCapturer, globalShortcut, ipcMain, powerMonitor, powerSaveBlocker, screen, session, shell } = require('electron');
+const { app, BrowserWindow, globalShortcut, ipcMain, powerMonitor, powerSaveBlocker, screen, session, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { execFileSync, spawn } = require('node:child_process');
@@ -22,6 +22,7 @@ const {
   parseKeywordText,
   crossedPauseCue
 } = require('./subtitle-source');
+const { createScreenGrabber } = require('./screen-grab');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -1198,43 +1199,74 @@ function setOverlayRadius(r) {
 /* -------------------------------------------------------- 视频角色定位 */
 
 /**
- * 叠加层（就是摆在你小地图上的那个红圈窗口）负责截屏、匹配、画点；主进程负责：
- *   · 选要截的屏幕（红圈所在的那块显示器）；
+ * 叠加层（就是摆在你小地图上的那个红圈窗口）负责匹配和画点；主进程负责：
+ *   · 截屏：用 screen-grab.js 的 GDI 小助手，只截红圈（你的小地图）周围一小块；
+ *     Chromium 自带的截屏在用户机器上报 NotReadableError，用不了；
  *   · 定位开着时，把本程序所有浮窗标成「不参与截屏」，免得红圈、弹幕、字幕被拍进去污染匹配；
- *   · 把视频那边送来的小地图切片转给叠加层；
+ *   · 视频切片一到，截一块屏，两样一起交给叠加层；
  *   · 按视频保存学到的缩放比例。
  */
 let locateKey = '';
 let locateDisplayId = null;
-let locateSourceId = '';
 let locateStatus = { status: 'off' };
+const grabber = createScreenGrabber();
+// 截屏统计（写进诊断日志）
+const grabDbg = { ok: 0, fail: 0, busy: 0, ms: 0, maxMs: 0, error: '' };
 
 /**
- * 叠加层调用 getDisplayMedia() 时由这里决定截哪块屏（不弹系统选择框）。
- * 只答应叠加层自己的请求；别的页面（包括 B 站页面所在的分区本来就不是这个 session）一律拒绝。
+ * 你小地图周围要截的那块屏（屏幕物理像素）和换算参数。
+ * 红圈窗口正中 = 你的小地图圆心；红圈半径 = 窗口短边一半 × 0.86（与 overlay.js 的 radius() 一致）。
+ * 学习阶段最大会按 1.65 × 1.03 的比例裁，所以截 1.6 × 1.75 倍半径的范围。
  */
-function installDisplayMediaHandler() {
-  session.defaultSession.setDisplayMediaRequestHandler(
-    async (request, callback) => {
-      try {
-        const f = request && request.frame;
-        const main = overlayWin && !overlayWin.isDestroyed() ? overlayWin.webContents.mainFrame : null;
-        const fromOverlay = !!(f && main && f.processId === main.processId && f.routingId === main.routingId);
-        if (!fromOverlay || !locateEnabled()) return callback({});
-        const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
-        const d = overlayDisplay();
-        const pick =
-          sources.find((s) => s.id === locateSourceId) ||
-          sources.find((s) => String(s.display_id) === String(d.id)) ||
-          sources[0];
-        callback(pick ? { video: pick } : {});
-      } catch (err) {
-        console.warn('[locate] 选择截屏源失败：', err.message);
-        callback({});
+function locateGrabRect() {
+  if (!overlayWin || overlayWin.isDestroyed()) return null;
+  const b = overlayWin.getBounds();
+  const d = screen.getDisplayMatching(b);
+  const sf = d.scaleFactor || 1;
+  const ringDip = (Math.min(b.width, b.height) / 2) * 0.86;
+  const centre = screen.dipToScreenPoint({ x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2) });
+  const ringR = ringDip * sf;
+  const half = Math.ceil(1.6 * ringR * 1.75);
+  const phys = screen.dipToScreenRect(null, d.bounds);
+  const x0 = Math.max(phys.x, centre.x - half);
+  const y0 = Math.max(phys.y, centre.y - half);
+  const x1 = Math.min(phys.x + phys.width, centre.x + half);
+  const y1 = Math.min(phys.y + phys.height, centre.y + half);
+  if (x1 - x0 < 16 || y1 - y0 < 16) return null;
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0, centre, ringR };
+}
+
+/** 视频切片到了：截屏，把切片和截图一起交给叠加层（上一张还没截完就丢掉这一帧） */
+function grabAndForward(patch) {
+  const rect = locateGrabRect();
+  if (!rect) return void (locateDbg.drop.noOverlay += 1);
+  if (grabber.busy) return void (grabDbg.busy += 1);
+  const t0 = Date.now();
+  grabber
+    .grab(rect.x, rect.y, rect.w, rect.h)
+    .then((f) => {
+      const ms = Date.now() - t0;
+      grabDbg.ok += 1;
+      grabDbg.ms = ms;
+      grabDbg.maxMs = Math.max(grabDbg.maxMs, ms);
+      if (!overlayWin || overlayWin.isDestroyed() || !locateEnabled()) return;
+      overlayWin.webContents.send('locate:patch', {
+        patch,
+        frame: { w: f.w, h: f.h, stride: f.stride, data: f.data, origin: { x: rect.x, y: rect.y }, centre: rect.centre, ringR: rect.ringR }
+      });
+      locateDbg.forwarded += 1;
+      if (locateStatus.status === 'error') {
+        locateStatus = { status: 'waiting' };
+        sendTo(consoleWin, 'locate:state', { ...locateStatus, enabled: true });
       }
-    },
-    { useSystemPicker: false }
-  );
+    })
+    .catch((err) => {
+      if (err.message === 'busy') return void (grabDbg.busy += 1);
+      grabDbg.fail += 1;
+      grabDbg.error = err.message;
+      locateStatus = { status: 'error', message: err.message };
+      sendTo(consoleWin, 'locate:state', { ...locateStatus, enabled: true });
+    });
 }
 
 function locateEnabled() {
@@ -1260,55 +1292,23 @@ function overlayDisplay() {
   return screen.getDisplayNearestPoint({ x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2) });
 }
 
-async function sendLocateConfig(reset) {
+function sendLocateConfig(reset) {
   applyCaptureProtection();
+  if (!locateEnabled()) grabber.stop();
+  else grabber.start(); // 提前把 PowerShell 小助手拉起来（首次启动约 1 秒）
   if (!overlayWin || overlayWin.isDestroyed() || overlayWin.webContents.isLoading()) return;
   if (!locateEnabled()) {
     overlayWin.webContents.send('locate:config', { enabled: false });
     return;
   }
-  const d = overlayDisplay();
-  let sourceId = '';
-  try {
-    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
-    const hit = sources.find((s) => String(s.display_id) === String(d.id)) || sources[0];
-    sourceId = hit ? hit.id : '';
-  } catch (err) {
-    console.warn('[locate] 枚举屏幕失败：', err.message);
-  }
-  locateDisplayId = d.id;
-  locateSourceId = sourceId;
-  if (!overlayWin || overlayWin.isDestroyed()) return;
+  locateDisplayId = overlayDisplay().id;
   const by = settings.bearing.locateScaleBy || {};
   overlayWin.webContents.send('locate:config', {
     enabled: true,
-    sourceId,
-    display: d.bounds,
     savedScale: (locateKey && by[locateKey]) || 0,
     reset: !!reset
   });
-  startOverlayCapture();
 }
-
-/**
- * 以「用户手势」身份让叠加层开始截屏：getDisplayMedia() 没有手势会被拒绝，
- * 而叠加层鼠标穿透、永远收不到点击。executeJavaScript 的第二个参数 true 就是带手势执行。
- */
-function startOverlayCapture() {
-  if (!overlayWin || overlayWin.isDestroyed() || overlayWin.webContents.isLoading()) return;
-  // 让配置消息先到（同一条 IPC 通道是有序的，但 executeJavaScript 走另一条路，稍等一下）
-  setTimeout(() => {
-    if (!overlayWin || overlayWin.isDestroyed()) return;
-    overlayWin.webContents
-      .executeJavaScript('typeof window.__gifaStartCapture === "function" && window.__gifaStartCapture()', true)
-      .catch((err) => console.warn('[locate] 启动截屏失败：', err.message));
-  }, 300);
-}
-
-// 截屏失败（比如显示器刚切换、第一次被拒绝）时每 15 秒带手势重试一次
-setInterval(() => {
-  if (locateEnabled() && locateStatus.status === 'error') startOverlayCapture();
-}, 15000);
 
 /**
  * 诊断日志：data\locate-debug.log，每 2 秒一行 JSON，把三段链路放在一起：
@@ -1330,9 +1330,10 @@ function writeLocateLog(videoDiag) {
     status: locateStatus.status,
     statusMessage: locateStatus.message || '',
     video: videoDiag,
-    main: { fromVideo: locateDbg.fromVideo, forwarded: locateDbg.forwarded, drop: locateDbg.drop },
+    main: { fromVideo: locateDbg.fromVideo, forwarded: locateDbg.forwarded, drop: locateDbg.drop, grab: { ...grabDbg, helper: grabber.running } },
     overlayDiag: locateDbg.overlay
   };
+  Object.assign(grabDbg, { ok: 0, fail: 0, busy: 0, ms: 0, maxMs: 0, error: '' });
   locateDbg.fromVideo = 0;
   locateDbg.forwarded = 0;
   locateDbg.drop = { disabled: 0, bad: 0, noOverlay: 0, newVideo: 0 };
@@ -1356,8 +1357,8 @@ function writeLocateLog(videoDiag) {
     else if (videoDiag.noMap && !videoDiag.sent) reason = 'video-no-map';
     else if (videoDiag.edge && !videoDiag.sent) reason = 'video-edge';
     else if (videoDiag.readFail && !videoDiag.sent) reason = 'video-read';
+    else if (videoDiag.sent && !line.main.forwarded && line.main.grab.fail) reason = 'no-capture';
     else if (videoDiag.sent && !line.main.forwarded) reason = 'main-drop';
-    else if (line.overlayDiag && line.overlayDiag.noCapture) reason = 'no-capture';
     sendTo(consoleWin, 'locate:state', { ...locateStatus, enabled: true, reason });
   }
 }
@@ -2487,8 +2488,7 @@ function registerIpc() {
       sendLocateConfig(true);
       return void (locateDbg.drop.newVideo += 1);
     }
-    overlayWin.webContents.send('locate:patch', p);
-    locateDbg.forwarded += 1;
+    grabAndForward(p);
   });
   // 诊断：视频页面每 2 秒报一次（为什么发 / 没发切片），叠加层同样报一次；合起来写进 data\locate-debug.log
   ipcMain.on('locate:diag', (event, d) => {
@@ -2917,7 +2917,6 @@ if (!gotLock) {
       /* ignore */
     }
     registerIpc();
-    installDisplayMediaHandler();
     createConsole(); // 先出启动器，配置好了再点「启动跟跑」
     registerHotkeys();
 
@@ -2955,6 +2954,7 @@ if (!gotLock) {
   app.on('window-all-closed', () => app.quit());
   app.on('will-quit', () => {
     clearInterval(hoverTimer);
+    grabber.stop();
     cancelTemporarySpeed();
     if (saveTimer) flushSettings();
     globalShortcut.unregisterAll();
