@@ -10,5 +10,6 @@ contextBridge.exposeInMainWorld('overlayApi', {
   onLocatePatch: (cb) => ipcRenderer.on('locate:patch', (_e, p) => cb(p)),
   locateLearned: (scale) => ipcRenderer.send('locate:learned', scale),
   locateStatus: (s) => ipcRenderer.send('locate:status', s),
-  locateDiag: (d) => ipcRenderer.send('locate:odiag', d)
+  locateDiag: (d) => ipcRenderer.send('locate:odiag', d),
+  locateDump: (d) => ipcRenderer.send('locate:dump', d)
 });

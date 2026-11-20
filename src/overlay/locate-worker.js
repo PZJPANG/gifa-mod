@@ -61,8 +61,9 @@ self.onmessage = (e) => {
   let r = null;
   try {
     r = L.locateFrame({ gray: Float64Array.from(patch.gray), skip: patch.skip, cover: patch.cover }, sampleGame, N, R, state);
-  } finally {
+  } catch (err) {
     bitmap.close();
+    throw err;
   }
   const dot = tracker.push(r, m.now);
   if (!wasLocked && state.locked) self.postMessage({ type: 'learned', scale: state.scale });
@@ -72,6 +73,53 @@ self.onmessage = (e) => {
     locked: !!state.locked,
     scale: state.scale || 0,
     trusted: !!(r && r.trusted),
-    ms: performance.now() - t0
+    ms: performance.now() - t0,
+    // 诊断：这一帧的匹配分数（NCC 峰值、第二高峰、几个比例一致、最佳比例）
+    score: r ? { ncc: +r.ncc.toFixed(3), second: +r.second.toFixed(3), support: r.support, top: +(r.scale || 0).toFixed(3) } : null
   });
+
+  // 诊断截图：一直认不出来时，把「视频小地图切片」和「按当前比例裁出的你的小地图」各存一张，方便肉眼比对
+  if (m.dump) {
+    const N2 = N * N;
+    const vid = new Uint8ClampedArray(N2 * 4);
+    for (let i = 0; i < N2; i += 1) {
+      const v = patch.gray[i];
+      const flag = patch.skip && patch.skip[i];
+      vid[i * 4] = flag ? 255 : v;
+      vid[i * 4 + 1] = flag ? 0 : v;
+      vid[i * 4 + 2] = flag ? 255 : v;
+      vid[i * 4 + 3] = 255;
+    }
+    const s = state.scale || 1;
+    const half = (N / 2 / R) * ringR * s;
+    // 截图原样（彩色）裁一张，不经过灰度 / 图标处理
+    let game = null;
+    try {
+      ctx.clearRect(0, 0, N, N);
+      ctx.drawImage(bitmap, centre.x - half - origin.x, centre.y - half - origin.y, 2 * half, 2 * half, 0, 0, N, N);
+      game = new Uint8ClampedArray(ctx.getImageData(0, 0, N, N).data);
+    } catch {
+      /* ignore */
+    }
+    // 再存一张截图整块（不裁），看看你的小地图在不在截到的范围里、位置对不对
+    let whole = null;
+    try {
+      const W = Math.min(256, bitmap.width);
+      const H = Math.round((bitmap.height / bitmap.width) * W);
+      const c2 = new OffscreenCanvas(W, H);
+      const x2 = c2.getContext('2d');
+      x2.drawImage(bitmap, 0, 0, W, H);
+      // 标出算法认为的「你的小地图圆」
+      x2.strokeStyle = '#ff0000';
+      x2.lineWidth = 1;
+      x2.beginPath();
+      x2.arc(((centre.x - origin.x) / bitmap.width) * W, ((centre.y - origin.y) / bitmap.height) * H, (ringR / bitmap.width) * W, 0, Math.PI * 2);
+      x2.stroke();
+      whole = { w: W, h: H, data: new Uint8ClampedArray(x2.getImageData(0, 0, W, H).data) };
+    } catch {
+      /* ignore */
+    }
+    self.postMessage({ type: 'dump', n: N, R, scale: s, video: vid, game, whole });
+  }
+  bitmap.close();
 };

@@ -2647,6 +2647,20 @@ function registerIpc() {
     if (!overlayWin || overlayWin.isDestroyed() || event.sender !== overlayWin.webContents || !d) return;
     locateDbg.overlay = d;
   });
+  // 诊断截图：视频切片 / 按比例裁出的你的小地图 / 截图整块（红圈 = 算法认为的你的小地图），覆盖写
+  ipcMain.on('locate:dump', (event, d) => {
+    if (!overlayWin || overlayWin.isDestroyed() || event.sender !== overlayWin.webContents || !d) return;
+    const dir = app.getPath('userData');
+    for (const [name, url] of [['locate-video.png', d.video], ['locate-game.png', d.game], ['locate-capture.png', d.whole]]) {
+      const b64 = String(url || '').split(',')[1];
+      if (!b64) continue;
+      try {
+        fs.writeFileSync(path.join(dir, name), Buffer.from(b64, 'base64'));
+      } catch {
+        /* ignore */
+      }
+    }
+  });
   // 叠加层第一次锁定了这个视频的缩放比例：存下来，下次打开这个视频直接用
   ipcMain.on('locate:learned', (event, scale) => {
     if (!overlayWin || overlayWin.isDestroyed() || event.sender !== overlayWin.webContents) return;

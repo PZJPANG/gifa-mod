@@ -394,10 +394,30 @@ function ensureWorker() {
       window.overlayApi.locateLearned(m.scale);
       return;
     }
+    if (m.type === 'dump') {
+      // 诊断截图 → PNG → 主进程写进 data\
+      const toPng = (data, w, h) => {
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        c.getContext('2d').putImageData(new ImageData(data, w, h), 0, 0);
+        return c.toDataURL('image/png');
+      };
+      window.overlayApi.locateDump({
+        video: m.video ? toPng(m.video, m.n, m.n) : '',
+        game: m.game ? toPng(m.game, m.n, m.n) : '',
+        whole: m.whole ? toPng(m.whole.data, m.whole.w, m.whole.h) : '',
+        scale: m.scale
+      });
+      return;
+    }
     if (m.type !== 'result') return;
     locate.busy = false;
     locate.lastResult = m;
     locate.diag.results += 1;
+    if (m.score) {
+      locate.diag.scores = (locate.diag.scores || []).concat(`${m.score.ncc}/${m.score.second}/${m.score.support}@${m.score.top}`).slice(-4);
+    }
     locate.diag.lastMs = Math.round(m.ms || 0);
     locate.diag.maxMs = Math.max(locate.diag.maxMs, locate.diag.lastMs);
     const had = !!locate.dot;
@@ -441,8 +461,11 @@ async function onLocatePatch(msg) {
       }
     }
     const bitmap = await createImageBitmap(new ImageData(rgba, f.w, f.h));
+    // 一直认不出来时，每 6 秒让后台线程顺便存一组诊断截图
+    const dump = !locate.dot && Date.now() - (locate.lastDumpAt || 0) > 6000;
+    if (dump) locate.lastDumpAt = Date.now();
     ensureWorker().postMessage(
-      { type: 'frame', patch: msg.patch, bitmap, origin: f.origin, centre: f.centre, ringR: f.ringR, now: Date.now() },
+      { type: 'frame', patch: msg.patch, bitmap, origin: f.origin, centre: f.centre, ringR: f.ringR, now: Date.now(), dump },
       [bitmap]
     );
     locate.diag.framesOut += 1;
