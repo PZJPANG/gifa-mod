@@ -11,5 +11,6 @@ contextBridge.exposeInMainWorld('overlayApi', {
   locateLearned: (scale) => ipcRenderer.send('locate:learned', scale),
   locateStatus: (s) => ipcRenderer.send('locate:status', s),
   locateDiag: (d) => ipcRenderer.send('locate:odiag', d),
-  locateDump: (d) => ipcRenderer.send('locate:dump', d)
+  locateDump: (d) => ipcRenderer.send('locate:dump', d),
+  locateGrab: () => ipcRenderer.send('locate:grab')
 });

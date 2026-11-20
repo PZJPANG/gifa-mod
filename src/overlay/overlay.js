@@ -313,6 +313,7 @@ function draw() {
   if (tween.arrow.shown !== null) drawArrow(cx, cy, r, tween.arrow.shown);
   // 视频角色的位置点画在最上面：它是「去哪」，比方向更重要
   if (locate.dot && !placing) drawLocateDot(cx, cy, r, locate.dot);
+  else if (locate.memory && !placing) drawLocateMemory(cx, cy, r, locate.memory);
 }
 
 /* ------------------------------------------------------------ 视频角色位置 */
@@ -330,6 +331,10 @@ const locate = {
   worker: null,
   busy: false,
   dot: null,
+  // 博主小地图不见了之后，他最后出现的位置（相对你，单位同 dot）；armed = 后台线程手里有锚点，值得继续截屏跟踪
+  memory: null,
+  armed: false,
+  lastGrabAt: 0,
   lastPatchAt: 0,
   lastResult: null,
   status: '',
@@ -385,11 +390,92 @@ function drawLocateDot(cx, cy, r, dot) {
   ctx.restore();
 }
 
+/**
+ * 「博主最后出现的位置」：空心金圈 + 虚线（在你小地图里），或贴着红圈边的小箭头（在小地图外，指向那边）。
+ * 和实心的位置点区分开：这是记忆，不是博主此刻的位置。
+ */
+function drawLocateMemory(cx, cy, r, t) {
+  const ox = (t.x / LOCATE_PATCH_R) * r;
+  const oy = (t.y / LOCATE_PATCH_R) * r;
+  const dist = Math.hypot(ox, oy);
+  if (dist < 1) return;
+  const ux = ox / dist;
+  const uy = oy / dist;
+  const dpr = window.devicePixelRatio || 1;
+  const size = clamp(r * 0.085, 5, 11);
+  ctx.save();
+  ctx.shadowColor = SHADOW;
+  ctx.shadowBlur = 5 * dpr;
+  if (dist <= r * 0.95) {
+    const x = cx + ox;
+    const y = cy + oy;
+    if (dist > size * 3) {
+      ctx.setLineDash([3, 6]);
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = 'rgba(255, 214, 64, 0.6)';
+      ctx.beginPath();
+      ctx.moveTo(cx + ux * r * 0.18, cy + uy * r * 0.18);
+      ctx.lineTo(x - ux * size * 1.5, y - uy * size * 1.5);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // 空心圈：外白内金，中间一个小实心点
+    ctx.lineWidth = Math.max(3, size * 0.55);
+    ctx.strokeStyle = WHITE;
+    ctx.beginPath();
+    ctx.arc(x, y, size, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.shadowColor = 'transparent';
+    ctx.lineWidth = Math.max(1.6, size * 0.3);
+    ctx.strokeStyle = '#ffd640';
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, Math.max(1.5, size * 0.22), 0, Math.PI * 2);
+    ctx.fillStyle = '#ffd640';
+    ctx.fill();
+  } else {
+    // 在你小地图外：红圈边上一个金色三角，指向博主最后出现的方向
+    const a = Math.atan2(uy, ux);
+    const rr = r * 0.9;
+    ctx.translate(cx + ux * rr, cy + uy * rr);
+    ctx.rotate(a);
+    const s = size * 1.2;
+    ctx.beginPath();
+    ctx.moveTo(s, 0);
+    ctx.lineTo(-s * 0.7, -s * 0.75);
+    ctx.lineTo(-s * 0.35, 0);
+    ctx.lineTo(-s * 0.7, s * 0.75);
+    ctx.closePath();
+    ctx.fillStyle = '#ffd640';
+    ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.lineWidth = Math.max(1.5, s * 0.18);
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = WHITE;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
 function ensureWorker() {
   if (locate.worker) return locate.worker;
   const w = new Worker('./locate-worker.js');
   w.onmessage = (e) => {
     const m = e.data || {};
+    if (m.type === 'memory') {
+      if (m.done) locate.busy = false;
+      locate.armed = !!m.active;
+      const had = !!locate.memory;
+      locate.memory = m.target || null;
+      locate.diag.memory = m.target ? `${m.held ? 'held' : 'ok'} ${m.ncc}` : m.arrived ? 'arrived' : m.lost ? 'lost' : m.expired ? 'expired' : 'none';
+      if (had || locate.memory) draw();
+      if (!locate.dot) {
+        if (locate.memory) setLocateStatus('memory');
+        else if (m.arrived) setLocateStatus('arrived');
+        else if (locate.status === 'memory') setLocateStatus('waiting');
+      }
+      return;
+    }
     if (m.type === 'learned') {
       window.overlayApi.locateLearned(m.scale);
       return;
@@ -422,8 +508,14 @@ function ensureWorker() {
     locate.diag.maxMs = Math.max(locate.diag.maxMs, locate.diag.lastMs);
     const had = !!locate.dot;
     locate.dot = m.dot;
+    if (m.dot) {
+      // 博主又被认出来了：实时的点取代「最后位置」
+      locate.armed = true;
+      locate.memory = null;
+    }
     if (had || locate.dot) draw();
-    setLocateStatus(m.dot ? 'tracking' : m.locked ? 'searching' : 'learning', m.locked ? { scale: m.scale } : null);
+    if (!m.dot && locate.memory) setLocateStatus('memory');
+    else setLocateStatus(m.dot ? 'tracking' : m.locked ? 'searching' : 'learning', m.locked ? { scale: m.scale } : null);
   };
   w.onerror = (e) => {
     locate.busy = false;
@@ -439,9 +531,14 @@ function ensureWorker() {
  * 转成 ImageBitmap 交给后台线程（上一次没算完就丢掉这一帧）。
  */
 async function onLocatePatch(msg) {
-  if (!locate.enabled || placing || !msg || !msg.patch || !msg.frame) return;
-  locate.lastPatchAt = Date.now();
-  locate.diag.patchesIn += 1;
+  if (!locate.enabled || placing || !msg || !msg.frame) return;
+  // patch 为 null = 我们自己要的截图（博主小地图不见了，只跟踪「最后位置」）
+  if (msg.patch) {
+    locate.lastPatchAt = Date.now();
+    locate.diag.patchesIn += 1;
+  } else {
+    locate.diag.memFrames = (locate.diag.memFrames || 0) + 1;
+  }
   if (locate.busy) return void (locate.diag.busy += 1);
   const f = msg.frame;
   const src = f.data;
@@ -462,7 +559,7 @@ async function onLocatePatch(msg) {
     }
     const bitmap = await createImageBitmap(new ImageData(rgba, f.w, f.h));
     // 一直认不出来时，每 6 秒让后台线程顺便存一组诊断截图
-    const dump = !locate.dot && Date.now() - (locate.lastDumpAt || 0) > 6000;
+    const dump = !!msg.patch && !locate.dot && Date.now() - (locate.lastDumpAt || 0) > 6000;
     if (dump) locate.lastDumpAt = Date.now();
     ensureWorker().postMessage(
       { type: 'frame', patch: msg.patch, bitmap, origin: f.origin, centre: f.centre, ringR: f.ringR, now: Date.now(), dump },
@@ -487,7 +584,8 @@ setInterval(() => {
     locked: !!(locate.lastResult && locate.lastResult.locked),
     scale: locate.lastResult ? locate.lastResult.scale : 0,
     trusted: !!(locate.lastResult && locate.lastResult.trusted),
-    dot: !!locate.dot
+    dot: !!locate.dot,
+    armed: locate.armed
   });
   locate.diag = { patchesIn: 0, busy: 0, framesOut: 0, results: 0, lastMs: 0, maxMs: 0, error: '' };
 }, 2000);
@@ -503,10 +601,14 @@ window.overlayApi.onLocateConfig((c) => {
   if (c.reset || !was) {
     ensureWorker().postMessage({ type: 'reset', savedScale: c.savedScale || 0 });
     locate.dot = null;
+    locate.memory = null;
+    locate.armed = false;
     draw();
   }
   if (!locate.enabled) {
     locate.dot = null;
+    locate.memory = null;
+    locate.armed = false;
     draw();
     setLocateStatus('off');
     return;
@@ -516,10 +618,20 @@ window.overlayApi.onLocateConfig((c) => {
 
 // 一段时间没有新切片（视频暂停、过场、没小地图）：让点按时消失，别挂一个过期的点
 setInterval(() => {
-  if (!locate.enabled || !locate.worker || locate.busy) return;
-  if (locate.dot && Date.now() - locate.lastPatchAt > 600) locate.worker.postMessage({ type: 'tick', now: Date.now() });
-  if (!locate.dot && locate.status !== 'error' && locate.lastPatchAt && Date.now() - locate.lastPatchAt > 3000) setLocateStatus('waiting');
-}, 300);
+  if (!locate.enabled || !locate.worker || locate.busy || placing) return;
+  const now = Date.now();
+  const quiet = now - locate.lastPatchAt;
+  if (locate.dot && quiet > 600 && now - (locate.lastTickAt || 0) >= 300) {
+    locate.lastTickAt = now;
+    locate.worker.postMessage({ type: 'tick', now });
+  }
+  // 博主的小地图没了、但之前认出过他：自己要截图，继续跟踪「他最后出现的位置」（约 3 次 / 秒）
+  if (locate.armed && quiet > 800 && now - locate.lastGrabAt >= 330) {
+    locate.lastGrabAt = now;
+    window.overlayApi.locateGrab();
+  }
+  if (!locate.dot && !locate.memory && locate.status !== 'error' && locate.status !== 'arrived' && locate.lastPatchAt && quiet > 3000) setLocateStatus('waiting');
+}, 110);
 
 /** 视角有更新时续期，并在过期那一刻重绘一次把绿弧收掉 */
 let viewExpireTimer = 0;

@@ -544,7 +544,89 @@
     };
   }
 
+  /**
+   * 「博主最后出现的位置」：博主的小地图消失（进任务 / 过场 / 视频暂停）之后，
+   * 把他最后被认出来的位置继续标在你的小地图上，直到你走到那里。
+   *
+   * 难点是点存的是「相对你」的位置，你一走就不对了。所以要跟踪你自己的移动：
+   * 拿你现在的小地图和「锚点时刻」的小地图比（同一个游戏、同一个缩放，比例恒为 1，比对视频容易得多），
+   * 得到你挪了多少 d，那么博主的位置 = d + 锚点时记下的相对位置 u。
+   * 走出去太远（≥ 0.45R）就把锚点换成现在这一帧（链式里程计），重叠永远够。
+   * 单位和位置点一样：比例 1 下的切片像素（屏幕偏移 = 值 × 红圈半径 / R）。
+   */
+  function createLastSeen(opts = {}) {
+    // 同一个游戏小地图自己比，真匹配 NCC 一般 0.85~1；换了个地方（传送）凑出来的假峰在 0.45~0.65
+    const minNcc = opts.minNcc ?? 0.8;
+    const minMargin = opts.minMargin ?? 0.12;
+    const reanchorR = opts.reanchor ?? 0.45;
+    const arriveR = opts.arrive ?? 0.15;
+    const lostMs = opts.lostMs ?? 4000;
+    const stepR = opts.step ?? 0.2; // 两帧之间最多挪多远（小地图半径的比例）还算「连贯」
+    const contNcc = opts.contNcc ?? 0.75;
+    const maxAgeMs = opts.maxAgeMs ?? 15 * 60 * 1000;
+    let anchor = null;
+    let last = null;
+
+    function clear() {
+      anchor = null;
+      last = null;
+    }
+
+    return {
+      /** 可信的实时匹配：记下这一刻你的小地图（比例 1）和博主相对你的位置 u */
+      setAnchor(game, u, now) {
+        anchor = { gray: game.gray, skip: game.skip, u: { x: u.x, y: u.y }, born: now, lostSince: 0, lastD: { x: 0, y: 0 } };
+        last = { x: u.x, y: u.y };
+      },
+      clear,
+      get active() {
+        return !!anchor;
+      },
+      /** 博主小地图不见了：用你现在的小地图（比例 1）跟踪你的移动，返回博主最后位置相对你现在的位置 */
+      track(game, n, R, now) {
+        if (!anchor) return { target: null };
+        if (now - anchor.born > maxAgeMs) {
+          clear();
+          return { target: null, expired: true };
+        }
+        const res = matchAll({ gray: anchor.gray, skip: anchor.skip, cover: R }, [{ scale: 1, gray: game.gray, skip: game.skip }], n, R, {
+          maxShift: 0.9
+        })[0];
+        // 自己和自己比，峰很高但「第二高峰」也常常很高（路、河这类重复纹理）。
+        // 所以除了独特度，再认「和上一帧的位移连贯」：人 0.35 秒走不远，跟上一帧差不多的峰就是真的。
+        const near = anchor.lastD && Math.hypot(res.dx - anchor.lastD.x, res.dy - anchor.lastD.y) <= stepR * R;
+        const ok = (res.ncc >= minNcc && res.ncc - res.second >= minMargin) || (near && res.ncc >= contNcc);
+        if (ok) {
+          anchor.lostSince = 0;
+          anchor.lastD = { x: res.dx, y: res.dy };
+          // 锚点时刻你站的位置，在你现在的小地图上是 (dx, dy)；博主在那个位置再加 u
+          const t = { x: res.dx + anchor.u.x, y: res.dy + anchor.u.y };
+          last = t;
+          if (Math.hypot(t.x, t.y) <= arriveR * R) {
+            clear();
+            return { target: null, arrived: true };
+          }
+          if (Math.hypot(res.dx, res.dy) >= reanchorR * R && res.ncc >= minNcc) {
+            anchor.gray = game.gray;
+            anchor.skip = game.skip;
+            anchor.u = t;
+            anchor.lastD = { x: 0, y: 0 };
+          }
+          return { target: t, held: false, ncc: res.ncc };
+        }
+        // 这一帧没对上（转镜头时视锥扫过、打开菜单……）：先沿用上一个位置，太久对不上就放弃
+        if (!anchor.lostSince) anchor.lostSince = now;
+        if (now - anchor.lostSince > lostMs) {
+          clear();
+          return { target: null, lost: true };
+        }
+        return { target: last, held: true, ncc: res.ncc };
+      }
+    };
+  }
+
   return {
+    createLastSeen,
     fft2,
     ringMask,
     splitRgba,

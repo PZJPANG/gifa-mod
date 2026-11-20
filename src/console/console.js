@@ -661,6 +661,8 @@ function renderLocateState(s) {
         learning: '正在学习博主小地图的缩放比例：跟着路线走几步，学好后自动出现黄点（这个视频只需学一次）',
         searching: `比例已学好${ratio}，但你现在不在博主的路线附近`,
         tracking: `正在跟踪${ratio}：黄点就是博主的位置`,
+        memory: '博主的小地图不见了（进任务 / 过场 / 暂停）：空心圈标着他最后出现的位置，走到那里会自动消失；在小地图外时红圈边上的小三角指向那边',
+        arrived: '你已经走到博主最后出现的位置了',
         error: `截屏失败：${s.message || '未知错误'}`
       }[s.status] || '准备中…';
   $('locateStatus').textContent = text;

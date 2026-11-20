@@ -257,6 +257,52 @@ console.log(`speed: ${(timeMs / timedFrames).toFixed(1)} ms per tracking update 
   assert.deepStrictEqual(Array.from(skip), [0, 1, 1, 1, 0, 0, 0, 0, 1]);
 }
 
+/* ---- 5b. last-seen position: guide's minimap disappears, you walk there ---- */
+{
+  const ring = 1.04;
+  const wpp = (gameMinimapR * ring) / R; // world px per scale-1 patch px
+  const sampler = (p) => gameSampler(p, ring)(1);
+  let ok = 0, judged = 0, arrivedAt = -1, maxErr = 0;
+  for (let run = 0; run < 6; run++) {
+    const L2 = L.createLastSeen();
+    let me = { x: 300 + rnd() * 300, y: 300 + rnd() * 300 };
+    const a = rnd() * Math.PI * 2, dist = 15 + rnd() * 15; // guide 15..30 world px away when their map disappears
+    const guide = { x: me.x + Math.cos(a) * dist, y: me.y + Math.sin(a) * dist };
+    L2.setAnchor(sampler(me), { x: (guide.x - me.x) / wpp, y: (guide.y - me.y) / wpp }, 0);
+    // first wander sideways a bit (the marker must stay on the guide's spot), then walk to it
+    for (let f = 1; f <= 40; f++) {
+      if (f <= 10) me = { x: me.x + Math.cos(a + 1.6) * 2.5, y: me.y + Math.sin(a + 1.6) * 2.5 };
+      else {
+        const dx = guide.x - me.x, dy = guide.y - me.y, d = Math.hypot(dx, dy);
+        if (d > 0) me = { x: me.x + (dx / d) * Math.min(2.5, d), y: me.y + (dy / d) * Math.min(2.5, d) };
+      }
+      const r = L2.track(sampler(me), N, R, f * 300);
+      if (r.arrived) { if (arrivedAt < 0 || f < arrivedAt) arrivedAt = f; break; }
+      if (!r.target) break;
+      judged++;
+      const e = Math.hypot(r.target.x - (guide.x - me.x) / wpp, r.target.y - (guide.y - me.y) / wpp);
+      maxErr = Math.max(maxErr, e);
+      if (process.env.LOCATE_DEBUG) console.log(`    run ${run} f${f} err ${e.toFixed(1)} held ${r.held} ncc ${(r.ncc || 0).toFixed(2)} dist ${Math.hypot(guide.x - me.x, guide.y - me.y).toFixed(1)}`);
+      if (e <= 2.5) ok++;
+    }
+    assert(!L2.active, `run ${run}: should have arrived and cleared`);
+  }
+  console.log(`last-seen marker: ${ok}/${judged} frames within 2.5px (max error ${maxErr.toFixed(1)}px), arrival detected in every run`);
+  assert(ok >= 0.9 * judged, 'marker should stay on the guide\'s last spot while you walk');
+
+  // teleport / totally different place: tracking is lost and the marker goes away (no stale guess forever)
+  const L3 = L.createLastSeen();
+  L3.setAnchor(sampler({ x: 400, y: 400 }), { x: 10, y: 5 }, 0);
+  let gone = false;
+  for (let f = 1; f <= 30 && !gone; f++) {
+    const r = L3.track(sampler({ x: 800, y: 200 }), N, R, f * 300);
+    if (process.env.LOCATE_DEBUG) console.log(`    teleport f${f} held ${r.held} ncc ${(r.ncc || 0).toFixed(2)}`);
+    gone = !r.target;
+  }
+  assert(gone && !L3.active, 'after a teleport the marker must disappear');
+  console.log('last-seen: teleport clears the marker');
+}
+
 /* ---- 6. speed (what one tracking update costs; the overlay runs ~4 per second) ---- */
 {
   const sampler = gameSampler({ x: 500, y: 500 }, 1.0);

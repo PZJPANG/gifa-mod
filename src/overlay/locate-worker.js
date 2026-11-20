@@ -13,6 +13,8 @@
  * 回复：
  *   { type: 'result', dot, locked, scale, trusted, ms }
  *   { type: 'learned', scale }       比例第一次锁定 —— 主进程按视频存起来，下次直接用
+ *   { type: 'memory', target, held, arrived, lost } 博主小地图不见了之后，他最后出现的位置（相对你，比例 1 单位）
+ * frame 的 patch 可以是 null（博主小地图不见了，只截了你的小地图）：只跟踪「最后位置」。
  */
 
 importScripts('./locate-core.js');
@@ -20,12 +22,31 @@ const L = self.GifaLocate;
 
 let state = {};
 let tracker = L.createTracker();
+let lastSeen = L.createLastSeen();
 let canvas = null;
 let ctx = null;
 
 function reset(savedScale) {
   state = savedScale ? { scale: savedScale, locked: true, hist: [] } : {};
   tracker = L.createTracker();
+  lastSeen = L.createLastSeen();
+}
+
+/** 「博主最后出现的位置」跟踪结果：target 为 null 表示不画（到了 / 跟丢 / 没有记录） */
+function postMemory(res, now, done = false) {
+  if (!res) return;
+  self.postMessage({
+    type: 'memory',
+    done,
+    active: lastSeen.active,
+    target: res.target,
+    held: !!res.held,
+    arrived: !!res.arrived,
+    lost: !!res.lost,
+    expired: !!res.expired,
+    ncc: res.ncc != null ? +res.ncc.toFixed(3) : null,
+    now
+  });
 }
 
 self.onmessage = (e) => {
@@ -42,8 +63,9 @@ self.onmessage = (e) => {
   if (m.type !== 'frame') return;
 
   const { patch, bitmap, origin, centre, ringR } = m;
-  const N = patch.n;
-  const R = patch.R;
+  // patch 为 null：博主的小地图不见了，主进程照样截你的小地图来，只做「最后位置」跟踪
+  const N = patch ? patch.n : 128;
+  const R = patch ? patch.R : 40;
   if (!canvas || canvas.width !== N) {
     canvas = new OffscreenCanvas(N, N);
     ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -57,15 +79,31 @@ self.onmessage = (e) => {
   };
 
   const t0 = performance.now();
+  if (!patch) {
+    let res = { target: null };
+    try {
+      const dot = tracker.push(null, m.now);
+      if (!dot) res = lastSeen.track(sampleGame(1), N, R, m.now);
+    } finally {
+      bitmap.close();
+      // done：这一帧算完了（叠加层据此放行下一帧）
+      postMemory(res, m.now, true);
+    }
+    return;
+  }
   const wasLocked = !!state.locked;
   let r = null;
+  let dot = null;
   try {
     r = L.locateFrame({ gray: Float64Array.from(patch.gray), skip: patch.skip, cover: patch.cover }, sampleGame, N, R, state);
+    dot = tracker.push(r, m.now);
+    // 点正显示、而且这一帧是新认出来的：记下锚点（你此刻的小地图 + 博主相对你的位置）
+    if (dot && !dot.held && r && r.trusted) lastSeen.setAnchor(sampleGame(1), { x: dot.x, y: dot.y }, m.now);
+    else if (!dot && lastSeen.active) postMemory(lastSeen.track(sampleGame(1), N, R, m.now), m.now);
   } catch (err) {
     bitmap.close();
     throw err;
   }
-  const dot = tracker.push(r, m.now);
   if (!wasLocked && state.locked) self.postMessage({ type: 'learned', scale: state.scale });
   self.postMessage({
     type: 'result',

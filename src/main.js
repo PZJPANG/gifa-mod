@@ -2671,6 +2671,12 @@ function registerIpc() {
     if (!win || win.isDestroyed() || event.sender !== win.webContents || !d) return;
     writeLocateLog(d);
   });
+  // 博主的小地图不见了（进任务 / 过场）：叠加层要继续跟踪「他最后出现的位置」，只截你的小地图（不带视频切片）
+  ipcMain.on('locate:grab', (event) => {
+    if (!overlayWin || overlayWin.isDestroyed() || event.sender !== overlayWin.webContents) return;
+    if (!locateEnabled()) return;
+    grabAndForward(null);
+  });
   ipcMain.on('locate:odiag', (event, d) => {
     if (!overlayWin || overlayWin.isDestroyed() || event.sender !== overlayWin.webContents || !d) return;
     locateDbg.overlay = d;
