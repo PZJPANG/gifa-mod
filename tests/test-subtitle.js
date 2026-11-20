@@ -7,7 +7,7 @@ const assert = require('node:assert');
 
 const src = path.join(__dirname, '..', 'src');
 let fail = 0;
-for (const f of ['main.js', 'preload.js', 'webview-preload.js', 'subtitle-source.js', 'renderer/app.js', 'console/console.js', 'subtitle/subtitle.js', 'subtitle/preload.js', 'danmaku/danmaku.js', 'danmaku/preload.js', 'overlay/overlay.js', 'overlay/preload.js', 'overlay/locate-core.js', 'overlay/locate-worker.js', 'screen-grab.js', 'turn-detect.js', 'turn/turn.js', 'turn/preload.js', 'hotkey-config.js']) {
+for (const f of ['main.js', 'preload.js', 'webview-preload.js', 'subtitle-source.js', 'renderer/app.js', 'console/console.js', 'subtitle/subtitle.js', 'subtitle/preload.js', 'danmaku/danmaku.js', 'danmaku/preload.js', 'overlay/overlay.js', 'overlay/preload.js', 'overlay/locate-core.js', 'overlay/locate-worker.js', 'screen-grab.js', 'direction-hints.js', 'turn/turn.js', 'turn/preload.js', 'hotkey-config.js']) {
   try {
     new vm.Script(`(function(require,module,exports,__dirname,__filename){${fs.readFileSync(path.join(src, f), 'utf8')}\n})`, { filename: f });
     console.log('syntax ok  ', f);

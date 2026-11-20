@@ -23,7 +23,7 @@ const {
   crossedPauseCue
 } = require('./subtitle-source');
 const { createScreenGrabber } = require('./screen-grab');
-const { createTurnDetector } = require('./turn-detect');
+const { parseDirection, crossedDirectionCue } = require('./direction-hints');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -505,10 +505,9 @@ const DEFAULT_SETTINGS = {
     area: 0.5, // 只占屏幕上方这么大的比例，免得挡住游戏中间
     avoidMap: true // 小地图那一块不画弹幕（位置跟「方位标定」里摆好的红圈走）
   },
-  // 转向提醒：博主左转 / 右转 / 掉头时，屏幕上弹一个大箭头（靠红箭头那一路行进方向判断）
+  // 方向提示：博主在字幕里说到「往左 / 往右 / 掉头」时，屏幕上弹出提示卡片
   turn: {
     enabled: true,
-    minTurn: 60, // 方向变化至少这么多度才算转弯
     x: null,
     y: null
   }
@@ -1650,6 +1649,8 @@ async function loadSubtitleFor(id, p) {
   setGuestLive(false);
   apPrev = null;
   apLiveHit = '';
+  dirPrev = null;
+  dirLiveLine = '';
   if (key) {
     cur.state = 'loading';
     cur.message = '正在读取字幕…';
@@ -1732,6 +1733,7 @@ function onPageSubtitleLive(text) {
   if (sub.state !== 'live') return;
   const line = String(text || '').slice(0, 500);
   checkAutoPauseLive(line);
+  checkDirectionHintLive(line);
   if (subReady()) subWin.webContents.send('sub:live', line);
 }
 
@@ -1748,9 +1750,9 @@ function pauseKeywords() {
   return apCompiled.list;
 }
 
-/** 字幕数据要不要拉：字幕层开着，或者自动暂停开着（它也要靠字幕判断） */
+/** 字幕数据要不要拉：字幕层开着，或者自动暂停 / 方向提示开着（它们也要靠字幕判断） */
 function subtitleNeeded() {
-  return !!(settings.subtitle.enabled || settings.autoPause.enabled);
+  return !!(settings.subtitle.enabled || settings.autoPause.enabled || settings.turn.enabled);
 }
 
 function autoPauseVideo(line) {
@@ -1815,6 +1817,7 @@ function onSubtitleTime(msg) {
   };
   ensureSubtitleLoaded();
   checkAutoPause(lastSubTime.current, lastSubTime.playing);
+  checkDirectionHint(lastSubTime.current, lastSubTime.playing);
   if (subReady()) subWin.webContents.send('sub:time', lastSubTime);
   onDanmakuTime(lastSubTime);
 }
@@ -2091,16 +2094,18 @@ function setDanmakuStyle(patch = {}) {
   return danmakuPublicState();
 }
 
-/* ------------------------------------------------------------ 转向提醒 */
+/* ------------------------------------------------------------ 方向提示 */
 
 /**
- * 博主左转 / 右转 / 掉头时在屏幕上弹一个提示（turn/index.html）。
- * 判定在 turn-detect.js，输入就是红箭头那一路行进方向（overlay:bearing）。
+ * 博主在字幕里说到「往左 / 往右 / 掉头」时，在屏幕上弹一个提示卡片（turn/index.html）。
+ * 认方向在 direction-hints.js；时间轴和字幕、自动暂停共用（浮窗的播放心跳）。
  * 窗口透明、鼠标穿透、置顶；位置可在启动器里「调整位置」拖动，记住。
  */
 let turnWin = null;
 let turnEditing = false;
-const turnDetector = createTurnDetector({ minTurn: 60 });
+let dirPrev = null; // 上一个心跳的播放时间：判断「这一句刚开始说」
+let dirLiveLine = ''; // 实时模式：上一句屏幕上的字幕
+let dirLast = { dir: '', at: 0 };
 
 function turnBounds() {
   const area = screen.getPrimaryDisplay().workArea;
@@ -2179,19 +2184,38 @@ function showTurnWindow() {
   return w;
 }
 
-/** 红箭头的每一次更新都喂给转向检测；画面里没小地图时清空，免得两段不相干的方向被拼成一次「转弯」 */
-function onBearingForTurn(p) {
-  if (!settings.turn.enabled || !p) return;
-  if (typeof p.angle !== 'number') {
-    if (!p.hold) turnDetector.reset();
+function showTurnHint(hit) {
+  const now = Date.now();
+  // 同一个方向 3 秒内不重复弹（博主经常一句话里重复「往左往左」，或者连着两句都在说）
+  if (hit.dir === dirLast.dir && now - dirLast.at < 3000) return;
+  dirLast = { dir: hit.dir, at: now };
+  const w = showTurnWindow();
+  const send = () => {
+    if (!w.isDestroyed()) w.webContents.send('turn:show', { dir: hit.dir, phrase: hit.phrase, text: hit.text || '' });
+  };
+  if (w.webContents.isLoading()) w.webContents.once('did-finish-load', send);
+  else send();
+}
+
+/** 按时间轴：心跳从 prev 走到 t 的这段里，有一句「刚开始说」的字幕提到方向就弹提示 */
+function checkDirectionHint(t, playing) {
+  const prev = dirPrev;
+  dirPrev = t;
+  if (!settings.turn.enabled || !playing || prev === null || sub.state !== 'ready') return;
+  if (t <= prev || t - prev > 2.5) return; // 拖进度 / 倒退不算「说到」
+  const hit = crossedDirectionCue(sub.cues, prev, t);
+  if (hit) showTurnHint(hit);
+}
+
+/** 实时模式（读播放器屏幕上的字幕）：换了一句新的、里面有方向就弹 */
+function checkDirectionHintLive(text) {
+  if (!settings.turn.enabled || !text || text === dirLiveLine) {
+    if (!text) dirLiveLine = '';
     return;
   }
-  if (p.hold) return; // 疑似反向的那一帧不算数
-  const ev = turnDetector.push(p.angle, Date.now());
-  if (ev && turnWin && !turnWin.isDestroyed() && !turnWin.webContents.isLoading()) {
-    if (!turnWin.isVisible()) turnWin.showInactive();
-    turnWin.webContents.send('turn:show', ev);
-  }
+  dirLiveLine = text;
+  const hit = parseDirection(text);
+  if (hit && lastSubTime && lastSubTime.playing) showTurnHint({ ...hit, text });
 }
 
 function setTurnEditing(on) {
@@ -2215,16 +2239,14 @@ function setTurnSettings(patch = {}) {
   const t = settings.turn;
   if (typeof patch.enabled === 'boolean') {
     t.enabled = patch.enabled;
-    if (t.enabled) showTurnWindow();
-    else {
+    if (t.enabled) {
+      showTurnWindow();
+      // 字幕层可能是关着的：方向提示同样要靠字幕，数据要单独拉起来
+      ensureSubtitleLoaded();
+    } else {
       if (turnEditing) setTurnEditing(false);
       if (turnWin && !turnWin.isDestroyed()) turnWin.hide();
-      turnDetector.reset();
     }
-  }
-  if (Number.isFinite(patch.minTurn)) {
-    t.minTurn = Math.min(120, Math.max(30, Math.round(patch.minTurn)));
-    turnDetector.setMinTurn(t.minTurn);
   }
 }
 
@@ -2615,7 +2637,6 @@ function registerIpc() {
   ipcMain.on('overlay:bearing', (_e, payload) => {
     lastBearing = payload;
     if (overlayWin && !overlayWin.isDestroyed()) overlayWin.webContents.send('bearing', payload);
-    onBearingForTurn(payload);
   });
   ipcMain.handle('turn:edit', (_e, on) => setTurnEditing(on));
 
@@ -3096,7 +3117,6 @@ if (!gotLock) {
     if (settings.subtitle.enabled) showSubtitleWindow();
     if (settings.danmaku.enabled) showDanmakuWindow();
     if (settings.turn.enabled) showTurnWindow();
-    turnDetector.setMinTurn(settings.turn.minTurn);
     // 换分辨率 / 插拔显示器：弹幕层要重新铺满主屏
     screen.on('display-metrics-changed', fitDanmakuWindow);
     screen.on('display-added', fitDanmakuWindow);

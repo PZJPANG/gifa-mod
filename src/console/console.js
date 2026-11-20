@@ -403,7 +403,6 @@ function fillSettings(settings) {
   $('setLocate').checked = b.locate !== false;
   const turn = settings.turn || {};
   $('setTurn').checked = turn.enabled !== false;
-  $('setTurnMin').value = String([45, 60, 80].includes(turn.minTurn) ? turn.minTurn : 60);
   $('setBearingSize').value = String(b.radius ?? 110);
   $('sizeVal').textContent = String(b.radius ?? 110);
 
@@ -696,9 +695,8 @@ function wireBearing() {
 
   $('setTurn').addEventListener('change', (e) => {
     window.api.save({ turn: { enabled: e.target.checked } });
-    if (e.target.checked && !state.boot.settings.bearing.enabled) toast('转向提醒要靠红箭头，请先打开「显示方位箭头」', true);
+    if (e.target.checked) toast('已开启：博主在字幕里说到往左 / 往右 / 掉头时会弹出提示');
   });
-  $('setTurnMin').addEventListener('change', (e) => window.api.save({ turn: { minTurn: Number(e.target.value) } }));
   const renderTurnMove = (editing) => {
     $('btnTurnMove').textContent = editing ? '锁定位置' : '调整位置';
     $('btnTurnMove').classList.toggle('primary', !!editing);
@@ -706,7 +704,7 @@ function wireBearing() {
   $('btnTurnMove').addEventListener('click', async () => {
     const editing = await window.api.turnEdit();
     renderTurnMove(editing);
-    toast(editing ? '把屏幕上的「右转」示例拖到合适位置，再点「锁定位置」' : '转向提醒的位置已锁定');
+    toast(editing ? '把屏幕上的「右转」示例拖到合适位置，再点「锁定位置」' : '方向提示的位置已锁定');
   });
   window.api.onTurnState((s) => renderTurnMove(s && s.editing));
 

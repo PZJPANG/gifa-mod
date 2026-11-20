@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * 转向提醒。主进程检测到博主左转 / 右转 / 掉头时发 turn:show，这里弹出约 2 秒后淡出。
+ * 方向提示。博主在字幕里说到往左 / 往右 / 掉头时，主进程发 turn:show，这里弹出约 2 秒后淡出。
  * 调整位置模式下常驻显示一个示例，方便拖到合适的地方。
  *
  * 图标是导航软件那种转弯箭头：圆头粗线从下往上走，圆滑地拐进转弯方向，末端一个圆角箭头。
@@ -49,18 +49,25 @@ let editing = false;
 let hideTimer = 0;
 let outTimer = 0;
 
-function paint(dir, degrees) {
+/** 第二行：博主原话（太长就截短），让人知道提示是从哪句话来的 */
+function quote(said) {
+  const s = String(said || '').replace(/\s+/g, '');
+  if (!s) return '';
+  return `“${s.length > 14 ? s.slice(0, 13) + '…' : s}”`;
+}
+
+function paint(dir, said) {
   drawIcon(dir);
   text.textContent = LABELS[dir] || '';
-  deg.textContent = dir === 'back' ? '方向反过来了' : Number.isFinite(degrees) ? `约 ${degrees}°` : '';
+  deg.textContent = quote(said);
   card.classList.remove('left', 'right', 'back');
   card.classList.add(dir);
 }
 
-function show(dir, degrees) {
+function show(dir, said) {
   clearTimeout(hideTimer);
   clearTimeout(outTimer);
-  paint(dir, degrees);
+  paint(dir, said);
   card.classList.remove('show', 'out');
   void card.offsetWidth; // 重新触发入场动画
   card.classList.add('show');
@@ -73,13 +80,13 @@ function show(dir, degrees) {
 
 window.turnApi.onTurn((t) => {
   if (!t) return;
-  show(t.dir, t.deg);
+  show(t.dir, t.text || t.phrase);
 });
 
 window.turnApi.onMode((mode) => {
   editing = mode === 'edit';
   document.body.classList.toggle('editing', editing);
-  if (editing) show('right', 90);
+  if (editing) show('right', '然后往右边走');
   else card.classList.remove('show', 'out');
 });
 

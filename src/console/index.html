@@ -230,18 +230,13 @@
                 </label>
                 <label class="setting" for="setTurn">
                   <span class="setting-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
-                  <span class="setting-text"><strong>转向提醒</strong><small>博主左转 / 右转 / 掉头时，屏幕上弹出提示（看红箭头那一路行进方向，原地转镜头不算）</small></span>
+                  <span class="setting-text"><strong>方向提示</strong><small>博主在字幕里说到「往左 / 往右 / 掉头」时，屏幕上弹出提示（视频要有字幕；「左右」这种说法不算）</small></span>
                   <span class="switch"><input type="checkbox" id="setTurn" /></span>
                 </label>
                 <div class="setting">
-                  <span class="setting-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
-                  <span class="setting-text"><strong><label for="setTurnMin">转多少度才提醒</label></strong><small>越小越灵敏，但小拐弯也会提醒</small></span>
+                  <span class="setting-ico"><svg class="ico"><use href="#i-window"></use></svg></span>
+                  <span class="setting-text"><strong>提示的位置</strong><small>点「调整位置」后在屏幕上拖动示例卡片，再点「锁定位置」</small></span>
                   <span class="setting-ctrl">
-                    <select id="setTurnMin" class="sel">
-                      <option value="45">45°（灵敏）</option>
-                      <option value="60">60°（推荐）</option>
-                      <option value="80">80°（只提醒大转弯）</option>
-                    </select>
                     <button id="btnTurnMove" class="small">调整位置</button>
                   </span>
                 </div>
