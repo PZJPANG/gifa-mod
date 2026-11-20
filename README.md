@@ -32,8 +32,11 @@ The video's minimap and your minimap are both north-up, so they differ only by z
 - **Matching** (`src/overlay/locate-core.js`, in a Web Worker): Sobel edge images, ring window with the player-arrow
   centre and icons removed, then **masked normalized cross-correlation** (Padfield, FFT-based) over all shifts.
   The zoom ratio is unknown (uploaders often show an enlarged map overlay), so it's searched coarse-to-fine over
-  0.6×–1.65×; a frame is trusted only if NCC ≥ 0.80, the peak is unique, and ≥3 of 5 neighbouring ratios agree on
-  the on-screen position. The ratio is locked only after 5 consistent trusted frames, then saved per video.
+  0.6×–1.65×; a frame is trusted only if NCC ≥ 0.50, the peak beats any other candidate ≥ 0.25 radius away by
+  ≥ 0.20, and ≥4 of 5 neighbouring ratios agree on the on-screen position (calibrated on real screenshots: real
+  true matches score only ~0.55 NCC — compression, the uploader's map style and the semi-transparent in-game
+  minimap — so uniqueness and cross-ratio agreement carry the decision, not raw NCC). The ratio is locked only
+  after 5 consistent trusted frames, then saved per video.
 - Tested on a synthetic map (`tests/test-locate.js`): 0 dots in the wrong place, 0 false dots off-route; with a saved
   ratio the dot shows on ~84% of on-route frames. Weak spots: featureless terrain (sea, desert, plain grass) → no dot.
 

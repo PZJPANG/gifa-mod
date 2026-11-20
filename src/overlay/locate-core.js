@@ -279,7 +279,7 @@
    *   ncc     峰值（-1~1）
    *   second  离峰 6px 以外的最高值 —— 峰不够「独一无二」说明地形有重复 / 太平
    */
-  function maskedNcc(game, video, n, maxShift, minOverlap) {
+  function maskedNcc(game, video, n, maxShift, minOverlap, exclude = 6) {
     const P = products(game, video, n);
     const [N, SF] = inversePair(P[0], P[1], n);
     const [SG, SFF] = inversePair(P[2], P[3], n);
@@ -324,7 +324,7 @@
       const y = (i / n) | 0;
       const ddx = Math.min(Math.abs(x - bx), n - Math.abs(x - bx));
       const ddy = Math.min(Math.abs(y - by), n - Math.abs(y - by));
-      if (ddx * ddx + ddy * ddy <= 36) continue;
+      if (ddx * ddx + ddy * ddy <= exclude * exclude) continue;
       if (surf[i] > second) second = surf[i];
     }
     const mean = s / cnt;
@@ -350,6 +350,11 @@
 
   /* ---------------- 单次匹配 / 多比例 ---------------- */
 
+  // 「第二高峰」至少离主峰这么远（单位：小地图半径）。真实地形的峰很宽，6px 外还是主峰自己的山坡，
+  // 拿它当「第二高峰」会让真匹配的独特度看起来很低；0.25R 以外才是真正的另一个候选位置。
+  let EXCLUDE_R = 0.25;
+  let MIN_OVERLAP = 0.18;
+
   const maskCache = new Map();
   function cachedMask(n, R, cover) {
     const key = `${n}|${R}|${cover || 0}`;
@@ -369,7 +374,9 @@
 
   function matchOne(vSpec, game, scale, n, R, opts = {}) {
     const gSpec = prepare(game.gray, n, cachedMask(n, R, 0), game.skip);
-    const r = maskedNcc(gSpec, vSpec, n, (opts.maxShift || 0.7) * R, opts.minOverlap ?? 0.3);
+    // minOverlap：重叠的有效像素至少占较少一方的这么多。曾经是 0.3 —— 真实数据里视频那边有不少图标被挖掉，
+    // 两边又各挖了中心一圈，博主在你小地图半径一半处时重叠只剩 ~25%，真位置直接被排除在搜索之外。
+    const r = maskedNcc(gSpec, vSpec, n, (opts.maxShift || 0.7) * R, opts.minOverlap ?? MIN_OVERLAP, opts.exclude ?? EXCLUDE_R * R);
     r.scale = scale;
     r.texture = Math.min(vSpec.texture, gSpec.texture);
     return r;
@@ -427,9 +434,12 @@
   // 锁定比例需要的「互相一致的可信帧」数量，以及一致的容差
   const LOCK_VOTES = 5;
   const LOCK_TOL = 0.03;
-  // 可信门槛：峰值够高、比第二高的峰高出一截（独一无二）、至少 3 个相邻比例给出同一位置。
-  // ncc 0.80 来自实测分布：在路线上（比例正确）90% 的帧 ≥ 0.88；不相干的地方最高 0.75。
-  const TRUST = { ncc: 0.8, margin: 0.06, support: 3 };
+  // 可信门槛：峰值够高、比 0.25R 以外的第二候选高出一截（独一无二）、至少 4 个相邻比例给出同一位置。
+  // 用真实截图标定（2026-11-20）：真匹配 NCC 0.56 / 独特度 0.31 / 4 个比例一致；
+  // 同一张真实小地图旋转、镜像后（真实纹理但对不上）最接近的一个是 0.52 / 0.22 / 3。
+  // 合成地图上真匹配 NCC 能到 0.9，但真实画面（视频压缩、博主的地图样式、你小地图的半透明底）只有 0.5~0.6，
+  // 所以不能只看 NCC 高低，「独一无二 + 多比例一致」才是主要依据。
+  const TRUST = { ncc: 0.5, margin: 0.2, support: 4 };
 
   function median(arr) {
     const s = arr.slice().sort((a, b) => a - b);

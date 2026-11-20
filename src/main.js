@@ -363,8 +363,9 @@ function biliFetch(url, extraHeaders) {
 const DEFAULT_HOTKEYS = {  togglePlay: 'Alt+Space',
   seekBack: 'Alt+Left',
   seekFwd: 'Alt+Right',
-  prevPart: 'Alt+Up',
-  nextPart: 'Alt+Down',
+  // 原来是 Alt+↑ / Alt+↓：紧挨着 Alt+← / Alt+→（快退 / 快进），太容易误按切到别的分 P
+  prevPart: 'Alt+PageUp',
+  nextPart: 'Alt+PageDown',
   toggleVisible: 'Alt+H',
   togglePass: 'Alt+L',
   toggleOpacity: 'Alt+O',
@@ -593,6 +594,12 @@ function loadSettings() {
   try {
     const raw = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
     const rawBearing = raw.bearing || {};
+
+    // 迁移：上一 / 下一分 P 还是旧默认的 Alt+↑ / Alt+↓（容易误按）就换成新默认；用户自己改过的不动
+    if (raw.hotkeys) {
+      if (raw.hotkeys.prevPart === 'Alt+Up') raw.hotkeys.prevPart = DEFAULT_HOTKEYS.prevPart;
+      if (raw.hotkeys.nextPart === 'Alt+Down') raw.hotkeys.nextPart = DEFAULT_HOTKEYS.nextPart;
+    }
 
     // 迁移：剔除 0.2.3 及更早版本写进出厂列表的猜测区域。
     // 那两条会被当成「已标定」，用户框一次就变成两处标定，先清干净再谈别的。

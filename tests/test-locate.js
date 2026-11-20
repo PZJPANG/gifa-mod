@@ -192,7 +192,9 @@ assert(a.wrong <= Math.ceil(0.05 * a.shown), 'near-misses (>7% of the radius) sh
 assert(a.shown >= 0.4 * a.judged, 'the dot should be visible a good part of the time on route');
 const k = report('second time (saved ratio)', cases, { known: true });
 assert.strictEqual(k.gross, 0, 'saved ratio: never in the wrong place');
-assert(k.wrong <= Math.ceil(0.05 * k.shown) && k.shown >= 0.75 * k.judged, 'with a saved ratio the dot should be close and visible');
+// visibility bar lowered from 75% to 70% when the trust rule was recalibrated on real screenshots (stricter
+// uniqueness + 4 agreeing ratios); correctness bars unchanged
+assert(k.wrong <= Math.ceil(0.05 * k.shown) && k.shown >= 0.7 * k.judged, 'with a saved ratio the dot should be close and visible');
 const b = report('first time + 1 icon the colour test misses', cases, { hidden: 1 });
 assert(b.gross <= Math.ceil(0.01 * b.shown) && b.wrong <= Math.ceil(0.08 * b.shown), 'an unflagged icon should cost only a little accuracy');
 console.log(`speed: ${(timeMs / timedFrames).toFixed(1)} ms per tracking update on average (the overlay runs ~4 per second)`);
@@ -240,9 +242,11 @@ console.log(`speed: ${(timeMs / timedFrames).toFixed(1)} ms per tracking update 
   assert.ok(h && h.held);
   assert.strictEqual(t.push(bad, 1100), null); // > 0.75 s without new evidence: gone
   // trust rules: high NCC but only 2 ring sizes agree, or a peak that isn't unique -> not trusted
-  assert.ok(L.isTrusted({ support: 3, ncc: 0.8, second: 0.5 }));
-  assert.ok(!L.isTrusted({ support: 2, ncc: 0.9, second: 0.3 }));
+  // calibrated on a real screenshot pair: true match 0.56 / margin 0.31 / 4 ratios; closest real negative 0.52 / 0.22 / 3
+  assert.ok(L.isTrusted({ support: 4, ncc: 0.56, second: 0.25 }));
+  assert.ok(!L.isTrusted({ support: 3, ncc: 0.52, second: 0.3 }));
   assert.ok(!L.isTrusted({ support: 5, ncc: 0.8, second: 0.77 }));
+  assert.ok(!L.isTrusted({ support: 5, ncc: 0.45, second: 0.1 }));
 }
 
 /* ---- 5. splitRgba flags icons, keeps terrain ---- */
