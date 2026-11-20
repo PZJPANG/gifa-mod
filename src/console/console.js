@@ -60,6 +60,8 @@ async function init() {
   wireVideo();
   wireSettings();
   wireBearing();
+  wireSubtitle();
+  wireDanmaku();
   wireHotkeys();
 
   // 启动器窗口可能被关掉再打开，此刻主进程的放置状态未必是初始值，
@@ -365,6 +367,16 @@ function renderPlaybackHints() {
     `按住 ${holdKey} 临时加速，松开恢复常规倍速；临时值不会替换保存的常规倍速。`;
   $('cycleSpeedHint').textContent =
     `按 ${cycleKey} 循环切换常规倍速：1 → 1.25 → 1.5 → 2 倍；可在「快捷键」中修改。`;
+  const playKey = prettify(hotkeys.togglePlay ?? 'Alt+Space');
+  $('autoPauseHint').textContent =
+    `字幕里出现下面的关键词时，这句说完就暂停视频；自己过完剧情后按 ${playKey} 继续。不显示字幕也能用。`;
+  const dmKey = prettify(hotkeys.toggleDanmaku ?? 'Alt+D');
+  $('dmHotkeyHint').textContent =
+    `游戏里按 ${dmKey} 显示 / 隐藏弹幕；可在「快捷键」中修改。弹幕铺在主显示器上，打开大地图时嫌挡可以先按一下隐藏。`;
+  const subKey = prettify(hotkeys.toggleSubtitle ?? 'Alt+C');
+  const subMoveKey = prettify(hotkeys.moveSubtitle ?? 'Alt+V');
+  $('subHotkeyHint').textContent =
+    `游戏里按 ${subKey} 显示 / 隐藏字幕，${subMoveKey} 调整位置 / 锁定；可在「快捷键」中修改。锁定后字幕鼠标穿透，不挡游戏操作。`;
 }
 
 function fillSettings(settings) {
@@ -400,7 +412,160 @@ function fillSettings(settings) {
   // 标定过的那一步打个绿勾，一眼能看出两步走到哪了
   $('btnPickRoi').classList.toggle('done', done);
 
-  for (const id of ['setOpacity', 'setVolume', 'setBearingSize']) paintRange($(id));
+  const sub = settings.subtitle || {};
+  $('setSubtitle').checked = !!sub.enabled;
+  $('setSubSize').value = String(sub.fontSize ?? 30);
+  $('subSizeVal').textContent = String(sub.fontSize ?? 30);
+  const bg = Math.round((sub.bgOpacity ?? 0.35) * 100);
+  $('setSubBg').value = String(bg);
+  $('subBgVal').textContent = bg + '%';
+
+  const ap = settings.autoPause || {};
+  $('setAutoPause').checked = ap.enabled !== false;
+  // 正在输入时别用广播回来的值覆盖用户手里的字
+  if (document.activeElement !== $('setAutoPauseWords')) {
+    $('setAutoPauseWords').value = (ap.keywords || []).join(', ');
+  }
+
+  const dm = settings.danmaku || {};
+  $('setDanmaku').checked = !!dm.enabled;
+  $('setDmAvoidMap').checked = dm.avoidMap !== false;
+  $('setDmArea').value = String(dm.area ?? 0.5);
+  $('setDmSpeed').value = String(dm.duration ?? 8);
+  $('setDmSize').value = String(dm.fontSize ?? 25);
+  $('dmSizeVal').textContent = String(dm.fontSize ?? 25);
+  const dop = Math.round((dm.opacity ?? 0.85) * 100);
+  $('setDmOpacity').value = String(dop);
+  $('dmOpacityVal').textContent = dop + '%';
+
+  for (const id of ['setOpacity', 'setVolume', 'setBearingSize', 'setSubSize', 'setSubBg', 'setDmSize', 'setDmOpacity']) {
+    paintRange($(id));
+  }
+}
+
+/* ------------------------------------------------------------ 游戏内字幕 */
+
+const SUB_STATUS = {
+  idle: '跟着跟跑浮窗里正在播的视频走',
+  loading: '正在读取字幕…'
+};
+
+/** 字幕卡片只认主进程推来的状态：开关、调整中、当前轨、可选语言 */
+function renderSubtitleState(s) {
+  if (!s) return;
+  state.subtitle = s;
+  $('setSubtitle').checked = !!s.enabled;
+
+  const btn = $('btnSubMove');
+  btn.textContent = s.editing ? '锁定位置' : '调整位置';
+  btn.classList.toggle('primary', !!s.editing);
+
+  let text = SUB_STATUS[s.state] || s.message || '';
+  if (s.state === 'ready' && s.current) {
+    text = `当前：${s.current.name}${s.current.ai ? '（AI 生成）' : ''} · 共 ${s.count} 句`;
+  } else if (s.message) {
+    text = s.message;
+  }
+  $('subStatus').textContent = text;
+
+  // 语言下拉：保留「自动」，其余按当前视频实际有的轨重建；用户选过但这个视频没有的语言也留着
+  const sel = $('setSubLang');
+  const want = s.lang || '';
+  const opts = [{ lan: '', name: '自动（优先中文）' }, ...s.tracks.map((t) => ({ lan: t.lan, name: t.name + (t.ai ? '（AI）' : '') }))];
+  if (want && !opts.some((o) => o.lan === want)) opts.push({ lan: want, name: `${want}（本视频没有）` });
+  sel.textContent = '';
+  for (const o of opts) {
+    const el = document.createElement('option');
+    el.value = o.lan;
+    el.textContent = o.name;
+    sel.appendChild(el);
+  }
+  sel.value = want;
+}
+
+function wireSubtitle() {
+  $('setSubtitle').addEventListener('change', async (e) => {
+    renderSubtitleState(await window.api.subtitleEnable(e.target.checked));
+    if (e.target.checked) toast('游戏内字幕已开启，点「调整位置」把它摆到合适的地方');
+  });
+
+  $('btnSubMove').addEventListener('click', async () => {
+    const editing = await window.api.subtitleEdit();
+    toast(
+      editing
+        ? '在屏幕上拖动字幕框，拖边缘缩放、滚轮调字号；好了再点「锁定位置」'
+        : '字幕位置已锁定，鼠标会穿透过去'
+    );
+  });
+
+  $('setSubSize').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('subSizeVal').textContent = String(v);
+    window.api.subtitleStyle({ fontSize: v });
+  });
+
+  $('setSubBg').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('subBgVal').textContent = v + '%';
+    window.api.subtitleStyle({ bgOpacity: v / 100 });
+  });
+
+  $('setSubLang').addEventListener('change', (e) => {
+    window.api.subtitleStyle({ lang: e.target.value });
+  });
+
+  $('setAutoPause').addEventListener('change', (e) => {
+    window.api.save({ autoPause: { enabled: e.target.checked } });
+    toast(e.target.checked ? '已开启：字幕说到「过完剧情」会自动暂停' : '已关闭自动暂停');
+  });
+
+  // 失焦或回车时保存；清空 = 恢复默认关键词（主进程负责）
+  const saveWords = async () => {
+    const next = await window.api.save({ autoPause: { keywords: $('setAutoPauseWords').value } });
+    if (next && next.autoPause) $('setAutoPauseWords').value = next.autoPause.keywords.join(', ');
+  };
+  $('setAutoPauseWords').addEventListener('change', saveWords);
+  $('setAutoPauseWords').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      saveWords().then(() => toast('暂停关键词已保存'));
+    }
+  });
+
+  window.api.onSubtitleState(renderSubtitleState);
+  window.api.subtitleState().then(renderSubtitleState).catch(() => {});
+}
+
+/* ------------------------------------------------------------ 全屏弹幕 */
+
+function renderDanmakuState(s) {
+  if (!s) return;
+  $('setDanmaku').checked = !!s.enabled;
+  let text = '跟着跟跑浮窗里正在播的视频走';
+  if (s.state === 'ready') text = `已载入 ${s.count} 条弹幕`;
+  else if (s.message) text = s.message;
+  $('dmStatus').textContent = text;
+}
+
+function wireDanmaku() {
+  $('setDanmaku').addEventListener('change', async (e) => {
+    renderDanmakuState(await window.api.danmakuEnable(e.target.checked));
+  });
+  $('setDmAvoidMap').addEventListener('change', (e) => window.api.danmakuStyle({ avoidMap: e.target.checked }));
+  $('setDmArea').addEventListener('change', (e) => window.api.danmakuStyle({ area: Number(e.target.value) }));
+  $('setDmSpeed').addEventListener('change', (e) => window.api.danmakuStyle({ duration: Number(e.target.value) }));
+  $('setDmSize').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('dmSizeVal').textContent = String(v);
+    window.api.danmakuStyle({ fontSize: v });
+  });
+  $('setDmOpacity').addEventListener('input', (e) => {
+    const v = Number(e.target.value);
+    $('dmOpacityVal').textContent = v + '%';
+    window.api.danmakuStyle({ opacity: v / 100 });
+  });
+  window.api.onDanmakuState(renderDanmakuState);
+  window.api.danmakuState().then(renderDanmakuState).catch(() => {});
 }
 
 function wireSettings() {

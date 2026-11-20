@@ -12,6 +12,16 @@ const { execFileSync, spawn } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 const hookHotkeys = require('./hook-hotkeys');
 const { mergeHotkeys, prepareHotkeyUpdate } = require('./hotkey-config');
+const {
+  createSubtitleSource,
+  tracksFromPlayerData,
+  pickTrack,
+  DEFAULT_PAUSE_KEYWORDS,
+  compileKeywords,
+  matchKeyword,
+  parseKeywordText,
+  crossedPauseCue
+} = require('./subtitle-source');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -358,7 +368,10 @@ const DEFAULT_HOTKEYS = {  togglePlay: 'Alt+Space',
   toggleOpacity: 'Alt+O',
   toggleImmersion: 'Alt+I',
   cycleSpeed: 'Alt+S',
-  holdSpeed: 'F8'
+  holdSpeed: 'F8',
+  toggleSubtitle: 'Alt+C',
+  moveSubtitle: 'Alt+V',
+  toggleDanmaku: 'Alt+D'
 };
 
 const PLAYBACK_RATES = [1, 1.25, 1.5, 2];
@@ -375,7 +388,10 @@ const HOTKEY_META = [
   { key: 'toggleOpacity', label: '半透明 开 / 关' },
   { key: 'toggleImmersion', label: '纯视频沉浸 开 / 关' },
   { key: 'cycleSpeed', label: '循环倍速 1 / 1.25 / 1.5 / 2' },
-  { key: 'holdSpeed', label: '长按临时加速（松开恢复）', hold: true }
+  { key: 'holdSpeed', label: '长按临时加速（松开恢复）', hold: true },
+  { key: 'toggleSubtitle', label: '游戏内字幕 显示 / 隐藏' },
+  { key: 'moveSubtitle', label: '字幕 调整位置 / 锁定' },
+  { key: 'toggleDanmaku', label: '全屏弹幕 显示 / 隐藏' }
 ];
 
 /**
@@ -456,6 +472,32 @@ const DEFAULT_SETTINGS = {
     radius: 110,
     x: null,
     y: null
+  },
+  // 游戏内字幕：独立的透明置顶窗，位置 / 大小 / 字号都记住
+  subtitle: {
+    enabled: false,
+    fontSize: 30,
+    bgOpacity: 0.35,
+    // 选定的字幕语言（lan，如 zh-CN / ai-zh）；空 = 自动挑
+    lang: '',
+    x: null,
+    y: null,
+    width: null,
+    height: null
+  },
+  // 字幕里说到「过完剧情」之类的话，这句说完就自动暂停视频，等玩家自己把剧情过完
+  autoPause: {
+    enabled: true,
+    keywords: DEFAULT_PAUSE_KEYWORDS.slice()
+  },
+  // 全屏弹幕：透明穿透层盖满主屏，跟着视频时间轴滚
+  danmaku: {
+    enabled: false,
+    opacity: 0.85,
+    fontSize: 25,
+    duration: 8, // 一条滚动弹幕横穿屏幕的秒数，越小越快
+    area: 0.5, // 只占屏幕上方这么大的比例，免得挡住游戏中间
+    avoidMap: true // 小地图那一块不画弹幕（位置跟「方位标定」里摆好的红圈走）
   }
 };
 
@@ -564,8 +606,19 @@ function loadSettings() {
         roiBy,
         // 清完一条不剩，就别再标榜「已标定」，否则界面显示 0 处却不去引导框选
         calibrated: !!rawBearing.calibrated && rois.length > 0
-      }
+      },
+      subtitle: { ...DEFAULT_SETTINGS.subtitle, ...(raw.subtitle || {}) },
+      autoPause: {
+        enabled: !(raw.autoPause && raw.autoPause.enabled === false),
+        keywords:
+          raw.autoPause && Array.isArray(raw.autoPause.keywords)
+            ? parseKeywordText(raw.autoPause.keywords.join(','))
+            : DEFAULT_PAUSE_KEYWORDS.slice()
+      },
+      danmaku: { ...DEFAULT_SETTINGS.danmaku, ...(raw.danmaku || {}) }
     };
+    // 已移除的 BetterGI 联动留下的旧设置，别再写回文件
+    delete settings.bgi;
   } catch {
     settings = structuredClone(DEFAULT_SETTINGS);
   }
@@ -801,6 +854,9 @@ function createWindow() {
     hoverFaded = false;
     // 主窗关了，叠加层不能独自留下，否则 window-all-closed 不触发、进程退不掉
     if (overlayWin && !overlayWin.isDestroyed()) overlayWin.destroy();
+    // 字幕跟着视频走：没有视频就没有时间轴，清掉，免得挂着一句停住的字幕
+    resetSubtitle();
+    resetDanmaku();
     notifyFloatState();
   });
 }
@@ -965,7 +1021,7 @@ function createConsole() {
     // 屏幕上、进程也不退出，用户还得再去任务栏手动关一次。
     if (quittingFromConsole) return;
     quittingFromConsole = true;
-    for (const w of [win, overlayWin, loginWin]) {
+    for (const w of [win, overlayWin, subWin, dmWin, loginWin]) {
       try {
         if (w && !w.isDestroyed()) w.destroy();
       } catch (err) {
@@ -1043,6 +1099,8 @@ function createOverlay() {
     settings.bearing.x = Math.round(b.x + b.width / 2);
     settings.bearing.y = Math.round(b.y + b.height / 2);
     persist();
+    // 红圈就摆在玩家的小地图上：弹幕的避让区跟着走
+    pushDanmakuStyle();
   });
 
   overlayWin.on('closed', () => {
@@ -1120,7 +1178,715 @@ function setOverlayRadius(r) {
     overlayWin.setBounds(overlayBounds());
   }
   persist();
+  pushDanmakuStyle();
   return settings.bearing.radius;
+}
+
+/* ------------------------------------------------------------ 游戏内字幕 */
+
+/**
+ * 把视频的 CC / AI 字幕单独显示在一块透明置顶窗里，叠在游戏画面上。
+ *
+ * 为什么不直接用 B 站播放器自带的字幕：那是画在视频里的，浮窗一缩小、
+ * 一隐藏（Alt+H）、一调半透明，字幕就跟着看不清。单独一层之后，
+ * 视频可以缩到角落甚至藏起来，只留字幕摆在准星下面。
+ *
+ * 数据流：
+ *   浮窗渲染层的播放心跳（id / p / currentTime / 倍速）→ subtitle:time → 主进程
+ *   主进程发现换片 / 切 P → 拉字幕轨与字幕 JSON → sub:cues 一次性下发
+ *   之后每个心跳 → sub:time 转发，字幕层本地按倍速外推
+ *
+ * 平时整窗鼠标穿透；「调整位置」进入编辑模式才能拖动、缩放、滚轮调字号。
+ */
+
+let subWin = null;
+let subEditing = false;
+let subToken = 0;
+let lastSubTime = null;
+let lastSubIdent = null; // 最近一次心跳里的 { id, p }：字幕关着时也记住，打开时直接拉
+const subtitleSource = createSubtitleSource((url) => biliFetch(url));
+
+function idleSubtitle(key = '') {
+  return { key, tracks: [], track: null, cues: [], state: 'idle', message: '' };
+}
+let sub = idleSubtitle();
+
+function subtitleDefaultBounds(width, height) {
+  const area = screen.getPrimaryDisplay().workArea;
+  return {
+    x: Math.round(area.x + (area.width - width) / 2),
+    y: Math.round(area.y + area.height - height - 80)
+  };
+}
+
+function subtitleBounds() {
+  const s = settings.subtitle;
+  const area = screen.getPrimaryDisplay().workArea;
+  const width = Math.max(200, Math.round(Number.isFinite(s.width) ? s.width : area.width * 0.6));
+  const height = Math.max(60, Math.round(Number.isFinite(s.height) ? s.height : 150));
+  const def = subtitleDefaultBounds(width, height);
+  let x = Number.isFinite(s.x) ? Math.round(s.x) : def.x;
+  let y = Number.isFinite(s.y) ? Math.round(s.y) : def.y;
+  // 换过显示器 / 分辨率后可能整块落在屏幕外，拉回默认位置
+  const visible = screen.getAllDisplays().some((d) => {
+    const w = d.bounds;
+    return x + width > w.x + 40 && x < w.x + w.width - 40 && y + height > w.y + 20 && y < w.y + w.height - 20;
+  });
+  if (!visible) ({ x, y } = def);
+  return { x, y, width, height };
+}
+
+function subtitleStyle() {
+  return { fontSize: settings.subtitle.fontSize, bgOpacity: settings.subtitle.bgOpacity };
+}
+
+function subtitlePublicState() {
+  return {
+    enabled: !!settings.subtitle.enabled,
+    editing: subEditing,
+    state: sub.state,
+    message: sub.message,
+    lang: settings.subtitle.lang || '',
+    current: sub.track ? { lan: sub.track.lan, name: sub.track.name, ai: sub.track.ai } : null,
+    tracks: sub.tracks.filter((t) => t.url).map((t) => ({ lan: t.lan, name: t.name, ai: t.ai })),
+    count: sub.cues.length
+  };
+}
+
+function notifySubtitleState() {
+  sendTo(consoleWin, 'subtitle:state', subtitlePublicState());
+}
+
+function subReady() {
+  return !!(subWin && !subWin.isDestroyed() && !subWin.webContents.isLoading());
+}
+
+function sendCues() {
+  if (subReady()) subWin.webContents.send('sub:cues', { cues: sub.cues, state: sub.state, message: sub.message });
+}
+
+function createSubtitleWindow() {
+  if (subWin && !subWin.isDestroyed()) return subWin;
+
+  subWin = new BrowserWindow({
+    ...subtitleBounds(),
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    // 透明窗在 Windows 上靠系统边框缩放不可靠，缩放把手在页面里自绘（subtitle.js）
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    focusable: false,
+    hasShadow: false,
+    show: false,
+    title: '字幕',
+    webPreferences: {
+      preload: path.join(__dirname, 'subtitle', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false
+    }
+  });
+
+  subWin.setAlwaysOnTop(true, 'screen-saver');
+  subWin.setIgnoreMouseEvents(!subEditing);
+  subWin.setFocusable(subEditing);
+
+  const remember = () => {
+    if (!subWin || subWin.isDestroyed()) return;
+    const b = subWin.getBounds();
+    Object.assign(settings.subtitle, { x: b.x, y: b.y, width: b.width, height: b.height });
+    persist();
+  };
+  subWin.on('move', remember);
+  subWin.on('resize', remember);
+
+  subWin.on('closed', () => {
+    subWin = null;
+    subEditing = false;
+    notifySubtitleState();
+  });
+
+  subWin.loadFile(path.join(__dirname, 'subtitle', 'index.html'));
+  subWin.webContents.on('did-finish-load', () => {
+    if (!subWin || subWin.isDestroyed()) return;
+    subWin.webContents.send('sub:style', subtitleStyle());
+    subWin.webContents.send('sub:mode', subEditing ? 'edit' : 'lock');
+    sendCues();
+    if (lastSubTime) subWin.webContents.send('sub:time', lastSubTime);
+  });
+
+  return subWin;
+}
+
+function showSubtitleWindow() {
+  const w = createSubtitleWindow();
+  if (w.isVisible()) return w;
+  if (w.webContents.isLoading()) {
+    w.once('ready-to-show', () => {
+      if (!w.isDestroyed() && settings.subtitle.enabled) w.showInactive();
+    });
+  } else {
+    w.showInactive();
+  }
+  return w;
+}
+
+/** 视频窗关掉时清空：没有时间轴了 */
+function resetSubtitle() {
+  subToken += 1;
+  sub = idleSubtitle();
+  lastSubTime = null;
+  lastSubIdent = null;
+  subLive = false;
+  if (subReady()) subWin.webContents.send('sub:live', '');
+  sendCues();
+  notifySubtitleState();
+}
+
+/** 按当前语言偏好挑轨并下载字幕正文；只改传进来的那份状态，过期的结果直接丢 */
+async function applySubtitleTrack(cur, token) {
+  const track = pickTrack(cur.tracks, settings.subtitle.lang);
+  const cues = track ? await subtitleSource.loadCues(track) : [];
+  if (token !== subToken) return;
+  cur.track = track;
+  cur.cues = cues;
+  cur.state = cues.length ? 'ready' : 'none';
+  cur.message = cues.length ? '' : '这条字幕是空的';
+}
+
+/**
+ * 字幕轨的来源优先级：
+ *  1. 跟跑浮窗里的 B 站页面上报的（webview-preload 旁听播放器 / 带 Cookie 主动请求）——
+ *     页面带着真实登录态，AI 字幕只有这条路稳定拿得到；
+ *  2. 等了 PAGE_TRACK_WAIT_MS 页面还没报，才用主进程自己的请求兜底；
+ *  3. 有轨但正文下不下来：让页面打开播放器自带的 CC，转发屏幕上的实时字幕（state = 'live'）。
+ *
+ * key 一律小写：页面报上来的、浮窗心跳带的 BV 号大小写不一定一致。
+ */
+const PAGE_TRACK_WAIT_MS = 6000;
+const pageTracks = new Map(); // key -> { tracks, needLogin }
+let pageWaiter = null; // { key, resolve, timer }
+let subLive = false;
+
+function subKey(id, p) {
+  return id ? `${String(id).toLowerCase()}#${p}` : '';
+}
+
+function setGuestLive(on) {
+  subLive = !!on;
+  if (playbackGuest && !playbackGuest.isDestroyed()) playbackGuest.send('player', { cmd: 'subtitle-live', on: subLive });
+  if (!subLive && subReady()) subWin.webContents.send('sub:live', '');
+}
+
+function waitForPageTracks(key) {
+  return new Promise((resolve) => {
+    if (pageWaiter) {
+      clearTimeout(pageWaiter.timer);
+      pageWaiter.resolve(null);
+    }
+    const w = {
+      key,
+      resolve,
+      timer: setTimeout(() => {
+        if (pageWaiter === w) pageWaiter = null;
+        resolve(null);
+      }, PAGE_TRACK_WAIT_MS)
+    };
+    pageWaiter = w;
+  });
+}
+
+function goLive(cur) {
+  cur.state = 'live';
+  cur.message = '正在读取播放器里的字幕（实时模式）';
+  setGuestLive(true);
+}
+
+/**
+ * 拿到字幕轨之后的统一处理；只改传进来的 cur，过期结果直接丢。
+ * entry = { tracks, needLogin, hasCc }；hasCc = 页面里播放器有 CC 按钮，说明这一集确实有字幕。
+ */
+async function applySubtitleTracks(cur, token, entry) {
+  const { tracks, needLogin, hasCc } = entry;
+  cur.tracks = tracks;
+  if (tracks.some((t) => t.url)) {
+    try {
+      await applySubtitleTrack(cur, token);
+    } catch {
+      /* 正文下载 / 解析失败，下面走实时兜底 */
+    }
+    if (token !== subToken) return;
+    if (cur.state !== 'ready') goLive(cur);
+    return;
+  }
+  // 接口没给出能下载的地址，但播放器自己有 CC：直接读播放器屏幕上的字幕
+  if (hasCc) {
+    goLive(cur);
+    return;
+  }
+  cur.state = 'none';
+  cur.message = needLogin
+    ? '没有找到字幕：AI 字幕要先在启动器里登录 B 站'
+    : '这个视频没有字幕（UP 主没上传，B 站也没生成 AI 字幕）';
+}
+
+function finishSubtitleLoad(token) {
+  if (token !== subToken) return;
+  sendCues();
+  notifySubtitleState();
+}
+
+async function loadSubtitleFor(id, p) {
+  const key = subKey(id, p);
+  const token = ++subToken;
+  const cur = idleSubtitle(key);
+  sub = cur;
+  setGuestLive(false);
+  apPrev = null;
+  apLiveHit = '';
+  if (key) {
+    cur.state = 'loading';
+    cur.message = '正在读取字幕…';
+  }
+  sendCues();
+  notifySubtitleState();
+  if (!key) return;
+
+  let entry = pageTracks.get(key) || null;
+  if (!entry) entry = await waitForPageTracks(key);
+  if (token !== subToken) return;
+
+  if (entry) {
+    await applySubtitleTracks(cur, token, entry);
+  } else {
+    try {
+      const { tracks, needLogin } = await subtitleSource.loadTracks(id, p);
+      if (token !== subToken) return;
+      await applySubtitleTracks(cur, token, { tracks, needLogin, hasCc: false });
+    } catch (err) {
+      if (token !== subToken) return;
+      cur.state = 'error';
+      cur.message = '读取字幕失败：' + (err && err.message ? err.message : err);
+    }
+  }
+  finishSubtitleLoad(token);
+}
+
+/** 页面（带登录态）上报的字幕轨 */
+function onPageSubtitleTracks(msg) {
+  const p = Math.max(1, Math.floor(Number(msg.p) || 1));
+  const key = subKey(msg.id, p);
+  if (!key) return;
+  const entry = {
+    ...tracksFromPlayerData({
+      subtitle: { subtitles: Array.isArray(msg.subtitles) ? msg.subtitles.slice(0, 20) : [] },
+      login_mid: msg.loggedIn ? 1 : 0,
+      need_login_subtitle: !!msg.needLoginSubtitle
+    }),
+    hasCc: !!msg.hasCc
+  };
+  pageTracks.delete(key);
+  pageTracks.set(key, entry);
+  if (pageTracks.size > 20) pageTracks.delete(pageTracks.keys().next().value);
+
+  if (pageWaiter && pageWaiter.key === key) {
+    const w = pageWaiter;
+    pageWaiter = null;
+    clearTimeout(w.timer);
+    w.resolve(entry);
+    return;
+  }
+  if (key !== sub.key) return;
+  // 实时模式中：后到了能下载的字幕轨就换成按时间轴的正式字幕；否则只是页面重载，重新打开实时读取
+  if (sub.state === 'live' && !(entry.tracks.some((t) => t.url) && !sub.tracks.some((t) => t.url))) {
+    setGuestLive(true);
+    return;
+  }
+  if (sub.state === 'live') {
+    const token = ++subToken;
+    const cur = sub;
+    setGuestLive(false);
+    applySubtitleTracks(cur, token, entry).finally(() => finishSubtitleLoad(token));
+    return;
+  }
+  // 主进程兜底已经下了「没字幕 / 出错」的结论，页面后到的完整列表要能翻盘
+  // （包括：先到的 player/v2 是空的，后到的新接口 / CC 按钮说其实有字幕）
+  if ((sub.state === 'none' || sub.state === 'error') && (entry.tracks.some((t) => t.url) || entry.hasCc)) {
+    const token = ++subToken;
+    const cur = sub;
+    cur.state = 'loading';
+    cur.message = '正在读取字幕…';
+    notifySubtitleState();
+    applySubtitleTracks(cur, token, entry).finally(() => finishSubtitleLoad(token));
+  }
+}
+
+/** 实时模式：播放器屏幕上的那一行字幕 */
+function onPageSubtitleLive(text) {
+  if (sub.state !== 'live') return;
+  const line = String(text || '').slice(0, 500);
+  checkAutoPauseLive(line);
+  if (subReady()) subWin.webContents.send('sub:live', line);
+}
+
+/* ---- 自动暂停：字幕说到「过完剧情」就停 ---- */
+
+let apPrev = null; // 上一个心跳的播放时间，用来判断「这一句刚刚说完」
+let apLiveHit = ''; // 实时模式：正在显示的、命中关键词的那句
+let apCompiled = { sig: '', list: [] };
+
+function pauseKeywords() {
+  const words = settings.autoPause.keywords;
+  const sig = words.join('\u0001');
+  if (apCompiled.sig !== sig) apCompiled = { sig, list: compileKeywords(words) };
+  return apCompiled.list;
+}
+
+/** 字幕数据要不要拉：字幕层开着，或者自动暂停开着（它也要靠字幕判断） */
+function subtitleNeeded() {
+  return !!(settings.subtitle.enabled || settings.autoPause.enabled);
+}
+
+function autoPauseVideo(line) {
+  if (!playbackGuest || playbackGuest.isDestroyed()) return;
+  playbackGuest.send('player', { cmd: 'pause' });
+  const key = settings.hotkeys.togglePlay || 'Alt+Space';
+  const short = String(line || '').replace(/\s+/g, ' ').slice(0, 40);
+  const text = `⏸ 已自动暂停：「${short}」· 过完剧情按 ${key} 继续`;
+  showNotice(text);
+  // 浮窗可能被游戏压住 / 被隐藏，字幕层上也亮一下
+  if (subReady()) subWin.webContents.send('sub:notice', text);
+}
+
+/** 按时间轴：心跳从 prev 走到 t 的这段里，有命中的那句说完了就停 */
+function checkAutoPause(t, playing) {
+  const prev = apPrev;
+  apPrev = t;
+  if (!settings.autoPause.enabled || !playing || prev === null || sub.state !== 'ready') return;
+  // 倒退、或者一下跳了好几秒（拖进度条 / 快进），不算「听完了这句」
+  if (t <= prev || t - prev > 2.5) return;
+  const hit = crossedPauseCue(sub.cues, prev, t, pauseKeywords());
+  if (hit) autoPauseVideo(hit.cue.text);
+}
+
+/** 实时模式没有时间轴：命中的那句从屏幕上消失（说完了）时停 */
+function checkAutoPauseLive(text) {
+  if (!settings.autoPause.enabled) return;
+  const hit = text && matchKeyword(text, pauseKeywords()) ? text : '';
+  if (apLiveHit && apLiveHit !== text) {
+    const line = apLiveHit;
+    apLiveHit = hit;
+    if (lastSubTime && lastSubTime.playing) autoPauseVideo(line);
+    return;
+  }
+  apLiveHit = hit;
+}
+
+function ensureSubtitleLoaded() {
+  if (!subtitleNeeded() || !lastSubIdent) return;
+  const { id, p } = lastSubIdent;
+  if (subKey(id, p) !== sub.key) loadSubtitleFor(id, p);
+}
+
+/** 登录状态变了（扫码登录成功）：同一个视频也要重拉，AI 字幕这时才拿得到 */
+function reloadSubtitle() {
+  // 登录前缓存的「要登录」结论全部作废，并让页面带新 Cookie 重新问一次
+  pageTracks.clear();
+  if (playbackGuest && !playbackGuest.isDestroyed()) playbackGuest.send('player', { cmd: 'subtitle-refresh' });
+  sub.key = '';
+  ensureSubtitleLoaded();
+}
+
+function onSubtitleTime(msg) {
+  const id = String((msg && msg.id) || '');
+  const p = Math.max(1, Math.floor(Number(msg && msg.p) || 1));
+  lastSubIdent = id ? { id, p } : null;
+  lastSubTime = {
+    current: Number(msg.current) || 0,
+    playing: !!msg.playing && !!msg.found,
+    rate: Number(msg.rate) || 1,
+    at: Date.now()
+  };
+  ensureSubtitleLoaded();
+  checkAutoPause(lastSubTime.current, lastSubTime.playing);
+  if (subReady()) subWin.webContents.send('sub:time', lastSubTime);
+  onDanmakuTime(lastSubTime);
+}
+
+function setSubtitleEnabled(on) {
+  settings.subtitle.enabled = !!on;
+  if (on) {
+    showSubtitleWindow();
+    // 重新打开时把当前状态再推一次：没字幕的原因会在画面上再亮几秒
+    sendCues();
+    ensureSubtitleLoaded();
+  } else {
+    subEditing = false;
+    if (subWin && !subWin.isDestroyed()) {
+      subWin.setIgnoreMouseEvents(true);
+      subWin.setFocusable(false);
+      if (!subWin.webContents.isLoading()) subWin.webContents.send('sub:mode', 'lock');
+      subWin.hide();
+    }
+  }
+  persist();
+  broadcast('settings:changed', settings);
+  notifySubtitleState();
+  return subtitlePublicState();
+}
+
+/** 不传参数 = 切换；主进程是唯一真相源，和方位叠加层的「放置 / 锁定」同一套路 */
+function setSubtitleEditing(on) {
+  const next = on === undefined || on === null ? !subEditing : !!on;
+  if (next && !settings.subtitle.enabled) setSubtitleEnabled(true);
+  subEditing = next;
+  const w = subWin && !subWin.isDestroyed() ? subWin : null;
+  if (w) {
+    w.setIgnoreMouseEvents(!subEditing);
+    w.setFocusable(subEditing);
+    if (subEditing) w.showInactive();
+    if (!w.webContents.isLoading()) w.webContents.send('sub:mode', subEditing ? 'edit' : 'lock');
+  }
+  notifySubtitleState();
+  return subEditing;
+}
+
+function setSubtitleStyle(patch = {}) {
+  const s = settings.subtitle;
+  if (Number.isFinite(patch.fontSize)) s.fontSize = Math.min(72, Math.max(14, Math.round(patch.fontSize)));
+  if (Number.isFinite(patch.bgOpacity)) s.bgOpacity = Math.min(0.9, Math.max(0, Number(patch.bgOpacity)));
+  let langChanged = false;
+  if (typeof patch.lang === 'string' && patch.lang !== s.lang) {
+    s.lang = patch.lang.slice(0, 32);
+    langChanged = true;
+  }
+  if (subReady()) subWin.webContents.send('sub:style', subtitleStyle());
+  persist();
+  broadcast('settings:changed', settings);
+
+  if (langChanged && sub.tracks.some((t) => t.url)) {
+    const token = ++subToken;
+    const cur = sub;
+    cur.state = 'loading';
+    cur.message = '正在切换字幕…';
+    notifySubtitleState();
+    applySubtitleTrack(cur, token)
+      .catch((err) => {
+        if (token !== subToken) return;
+        cur.state = 'error';
+        cur.message = '读取字幕失败：' + err.message;
+      })
+      .finally(() => {
+        if (token !== subToken) return;
+        sendCues();
+        notifySubtitleState();
+      });
+  } else {
+    notifySubtitleState();
+  }
+  return subtitlePublicState();
+}
+
+/* ------------------------------------------------------------ 全屏弹幕 */
+
+/**
+ * 一块透明、鼠标穿透、铺满主屏的窗口，像 B 站一样让弹幕从右往左飘。
+ * 时间轴和字幕共用浮窗的播放心跳；弹幕数据由主进程按 cid 拉整集 XML。
+ *
+ * 不挡小地图：原神的小地图在左上角，正好落在弹幕区里。弹幕层在那一块整块不画
+ * （裁掉而不是让轨道绕开，滚动弹幕从右边过来，到了地图那里就「消失」，过了再出现）。
+ * 位置优先用「方位标定」里摆在玩家小地图上的红圈（settings.bearing.x / y / radius，屏幕坐标），
+ * 没摆过就按原神默认 UI 布局估算（小地图圆心约在 0.144H, 0.111H，半径约 0.088H）。
+ */
+
+let dmWin = null;
+let dmToken = 0;
+let dm = { key: '', items: [], state: 'idle', message: '' };
+
+function danmakuDisplayBounds() {
+  return screen.getPrimaryDisplay().bounds;
+}
+
+/** 小地图避让区（弹幕窗自己的坐标系）；关了避让就返回 null */
+function danmakuMask() {
+  if (!settings.danmaku.avoidMap) return null;
+  const d = danmakuDisplayBounds();
+  const b = settings.bearing || {};
+  let cx = d.x + d.height * 0.144;
+  let cy = d.y + d.height * 0.111;
+  let r = d.height * 0.088;
+  const placed =
+    Number.isFinite(b.x) && Number.isFinite(b.y) &&
+    b.x >= d.x && b.x < d.x + d.width && b.y >= d.y && b.y < d.y + d.height;
+  if (placed) {
+    cx = b.x;
+    cy = b.y;
+    r = Math.max(40, Number(b.radius) || r);
+  }
+  // 比圆本身大一圈：外面还有罗盘刻度、方位箭头叠加层和地名 / 时间小字
+  const x1 = cx + r * 1.45;
+  const y1 = cy + r * 1.55;
+  return {
+    x: 0,
+    y: 0,
+    w: Math.round(Math.max(0, x1 - d.x)),
+    h: Math.round(Math.max(0, y1 - d.y))
+  };
+}
+
+function danmakuStyle() {
+  const s = settings.danmaku;
+  return { opacity: s.opacity, fontSize: s.fontSize, duration: s.duration, area: s.area, mask: danmakuMask() };
+}
+
+function dmReady() {
+  return !!(dmWin && !dmWin.isDestroyed() && !dmWin.webContents.isLoading());
+}
+
+function pushDanmakuStyle() {
+  if (dmReady()) dmWin.webContents.send('dm:style', danmakuStyle());
+}
+
+function sendDanmakuItems() {
+  if (dmReady()) dmWin.webContents.send('dm:items', { items: dm.items });
+}
+
+function danmakuPublicState() {
+  return { enabled: !!settings.danmaku.enabled, state: dm.state, message: dm.message, count: dm.items.length };
+}
+
+function notifyDanmakuState() {
+  sendTo(consoleWin, 'danmaku:state', danmakuPublicState());
+}
+
+function fitDanmakuWindow() {
+  if (dmWin && !dmWin.isDestroyed()) dmWin.setBounds(danmakuDisplayBounds());
+  pushDanmakuStyle();
+}
+
+function createDanmakuWindow() {
+  if (dmWin && !dmWin.isDestroyed()) return dmWin;
+  dmWin = new BrowserWindow({
+    ...danmakuDisplayBounds(),
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    focusable: false,
+    hasShadow: false,
+    show: false,
+    title: '弹幕',
+    webPreferences: {
+      preload: path.join(__dirname, 'danmaku', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false
+    }
+  });
+  dmWin.setAlwaysOnTop(true, 'screen-saver');
+  // 永远穿透：弹幕层盖满整个屏幕，绝不能吃掉游戏的鼠标
+  dmWin.setIgnoreMouseEvents(true);
+  dmWin.on('closed', () => {
+    dmWin = null;
+  });
+  dmWin.loadFile(path.join(__dirname, 'danmaku', 'index.html'));
+  dmWin.webContents.on('did-finish-load', () => {
+    if (!dmWin || dmWin.isDestroyed()) return;
+    dmWin.webContents.send('dm:style', danmakuStyle());
+    sendDanmakuItems();
+    if (lastSubTime) dmWin.webContents.send('dm:time', lastSubTime);
+  });
+  return dmWin;
+}
+
+function showDanmakuWindow() {
+  const w = createDanmakuWindow();
+  if (w.isVisible()) return w;
+  if (w.webContents.isLoading()) {
+    w.once('ready-to-show', () => {
+      if (!w.isDestroyed() && settings.danmaku.enabled) w.showInactive();
+    });
+  } else {
+    w.showInactive();
+  }
+  return w;
+}
+
+function resetDanmaku() {
+  dmToken += 1;
+  dm = { key: '', items: [], state: 'idle', message: '' };
+  sendDanmakuItems();
+  notifyDanmakuState();
+}
+
+async function loadDanmakuFor(id, p) {
+  const key = subKey(id, p);
+  const token = ++dmToken;
+  dm = { key, items: [], state: key ? 'loading' : 'idle', message: key ? '正在读取弹幕…' : '' };
+  sendDanmakuItems();
+  notifyDanmakuState();
+  if (!key) return;
+  try {
+    const items = await subtitleSource.loadDanmaku(id, p);
+    if (token !== dmToken) return;
+    dm.items = items;
+    dm.state = items.length ? 'ready' : 'none';
+    dm.message = items.length ? '' : '这个视频还没有弹幕';
+  } catch (err) {
+    if (token !== dmToken) return;
+    dm.state = 'error';
+    dm.message = '读取弹幕失败：' + (err && err.message ? err.message : err);
+  }
+  sendDanmakuItems();
+  notifyDanmakuState();
+}
+
+function ensureDanmakuLoaded() {
+  if (!settings.danmaku.enabled || !lastSubIdent) return;
+  const { id, p } = lastSubIdent;
+  if (subKey(id, p) !== dm.key) loadDanmakuFor(id, p);
+}
+
+function onDanmakuTime(t) {
+  ensureDanmakuLoaded();
+  if (dmReady() && t) dmWin.webContents.send('dm:time', t);
+}
+
+function setDanmakuEnabled(on) {
+  settings.danmaku.enabled = !!on;
+  if (on) {
+    showDanmakuWindow();
+    ensureDanmakuLoaded();
+  } else if (dmWin && !dmWin.isDestroyed()) {
+    dmWin.hide();
+  }
+  persist();
+  broadcast('settings:changed', settings);
+  notifyDanmakuState();
+  return danmakuPublicState();
+}
+
+function setDanmakuStyle(patch = {}) {
+  const s = settings.danmaku;
+  if (Number.isFinite(patch.opacity)) s.opacity = Math.min(1, Math.max(0.1, Number(patch.opacity)));
+  if (Number.isFinite(patch.fontSize)) s.fontSize = Math.min(48, Math.max(14, Math.round(patch.fontSize)));
+  if (Number.isFinite(patch.duration)) s.duration = Math.min(20, Math.max(3, Number(patch.duration)));
+  if (Number.isFinite(patch.area)) s.area = Math.min(1, Math.max(0.1, Number(patch.area)));
+  if (typeof patch.avoidMap === 'boolean') s.avoidMap = patch.avoidMap;
+  pushDanmakuStyle();
+  persist();
+  broadcast('settings:changed', settings);
+  return danmakuPublicState();
 }
 
 /* -------------------------------------------------------------- 全局热键 */
@@ -1149,6 +1915,21 @@ function handleHotkey(key, phase) {
   if (key === 'toggleVisible') return toggleVisible();
   if (key === 'togglePass') return setPass(!settings.clickThrough);
   if (key === 'toggleOpacity') return setOpacity(settings.opacity > 0.95 ? 0.65 : 1);
+  if (key === 'toggleSubtitle') {
+    const on = setSubtitleEnabled(!settings.subtitle.enabled).enabled;
+    showNotice(on ? '游戏内字幕已开启' : '游戏内字幕已关闭');
+    return;
+  }
+  if (key === 'toggleDanmaku') {
+    const on = setDanmakuEnabled(!settings.danmaku.enabled).enabled;
+    showNotice(on ? '全屏弹幕已开启' : '全屏弹幕已关闭');
+    return;
+  }
+  if (key === 'moveSubtitle') {
+    const editing = setSubtitleEditing();
+    showNotice(editing ? '拖动字幕到合适位置，再按一次锁定' : '字幕位置已锁定');
+    return;
+  }
   sendPlayerAction(key);
 }
 
@@ -1379,6 +2160,7 @@ function openLogin() {
       clearInterval(timer);
       console.log('[bili] 登录成功：', nav.uname, nav.vip ? '(大会员)' : '');
       broadcast('login:state', nav);
+      reloadSubtitle();
       currentLoginWindow.close();
     } finally {
       checking = false;
@@ -1539,6 +2321,42 @@ function registerIpc() {
     sendTo(consoleWin, 'auto-center-result', out);
     return out;
   });
+  /* ---- 游戏内字幕 ---- */
+
+  // 播放心跳只认跟跑浮窗自己的页面，别的窗口不能伪造时间轴
+  ipcMain.on('subtitle:time', (event, msg) => {
+    if (!win || win.isDestroyed() || event.sender !== win.webContents) return;
+    if (msg && typeof msg === 'object') onSubtitleTime(msg);
+  });
+  ipcMain.on('subtitle:tracks', (event, msg) => {
+    if (!win || win.isDestroyed() || event.sender !== win.webContents) return;
+    if (msg && typeof msg === 'object') onPageSubtitleTracks(msg);
+  });
+  ipcMain.on('subtitle:live', (event, text) => {
+    if (!win || win.isDestroyed() || event.sender !== win.webContents) return;
+    onPageSubtitleLive(text);
+  });
+  ipcMain.handle('subtitle:enable', (_e, on) => setSubtitleEnabled(on));
+  ipcMain.handle('subtitle:edit', (_e, on) => setSubtitleEditing(on));
+  ipcMain.handle('subtitle:style', (_e, patch) => setSubtitleStyle(patch && typeof patch === 'object' ? patch : {}));
+  ipcMain.handle('subtitle:state', () => subtitlePublicState());
+
+  /* ---- 全屏弹幕 ---- */
+  ipcMain.handle('danmaku:enable', (_e, on) => setDanmakuEnabled(on));
+  ipcMain.handle('danmaku:style', (_e, patch) => setDanmakuStyle(patch && typeof patch === 'object' ? patch : {}));
+  ipcMain.handle('danmaku:state', () => danmakuPublicState());
+  // 编辑模式下字幕层自绘把手拖出来的新尺寸；只在编辑模式、且只认字幕窗自己
+  ipcMain.on('subtitle:set-bounds', (event, b) => {
+    if (!subEditing || !subWin || subWin.isDestroyed() || event.sender !== subWin.webContents || !b) return;
+    if (![b.x, b.y, b.width, b.height].every(Number.isFinite)) return;
+    subWin.setBounds({
+      x: Math.round(b.x),
+      y: Math.round(b.y),
+      width: Math.max(200, Math.round(b.width)),
+      height: Math.max(60, Math.round(b.height))
+    });
+  });
+
   ipcMain.handle('overlay:place', (_e, on) => setOverlayPlacing(on));
   // 启动器重建 / 箭头开关切换后，用它把按钮文案对齐到主进程的真实状态
   ipcMain.handle('overlay:place-state', () => overlayPlacing);
@@ -1609,6 +2427,16 @@ function registerIpc() {
     if (patch.clickThrough !== undefined) setPass(patch.clickThrough);
     if (patch.opacity !== undefined) setOpacity(patch.opacity);
     if (patch.hotkeys) settings.hotkeys = { ...settings.hotkeys, ...patch.hotkeys };
+    if (patch.autoPause && typeof patch.autoPause === 'object') {
+      const ap = patch.autoPause;
+      if (typeof ap.enabled === 'boolean') settings.autoPause.enabled = ap.enabled;
+      if (typeof ap.keywords === 'string') {
+        const words = parseKeywordText(ap.keywords);
+        settings.autoPause.keywords = words.length ? words : DEFAULT_PAUSE_KEYWORDS.slice();
+      }
+      // 打开自动暂停时字幕层可能是关着的，字幕数据要单独拉起来
+      ensureSubtitleLoaded();
+    }
     if (patch.bearing) {
       const b = patch.bearing;
       if (b.calibrated !== undefined) settings.bearing.calibrated = !!b.calibrated;
@@ -1863,6 +2691,12 @@ if (!gotLock) {
     }
 
     if (settings.bearing.enabled && win) showOverlay();
+    if (settings.subtitle.enabled) showSubtitleWindow();
+    if (settings.danmaku.enabled) showDanmakuWindow();
+    // 换分辨率 / 插拔显示器：弹幕层要重新铺满主屏
+    screen.on('display-metrics-changed', fitDanmakuWindow);
+    screen.on('display-added', fitDanmakuWindow);
+    screen.on('display-removed', fitDanmakuWindow);
 
     // 只允许登录窗口弹 B 站域名的子窗口（第三方登录/扫码），其余一律拦截
     app.on('web-contents-created', (_e, contents) => {

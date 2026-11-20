@@ -155,6 +155,15 @@ function createWebview() {
       onGuestAutoCenter(e.args && e.args[0]);
       return;
     }
+    // 游戏内字幕：页面里带 Cookie 拿到的字幕轨、播放器屏幕上的实时字幕，原样转给主进程
+    if (e.channel === 'subtitle-tracks') {
+      if (window.api.subtitleTracks) window.api.subtitleTracks(e.args && e.args[0]);
+      return;
+    }
+    if (e.channel === 'subtitle-live') {
+      if (window.api.subtitleLive) window.api.subtitleLive(String((e.args && e.args[0]) || ''));
+      return;
+    }
     if (e.channel === 'bearing-dump') {
       onGuestDump(e.args && e.args[0]);
       return;
@@ -665,6 +674,18 @@ function applyState(v) {
   state.video = v;
   // 访客页心跳里带了 ?p=，自动连播下一 P 时在这里把下拉框校准过来
   syncPartFromGuest(v, true);
+
+  // 游戏内字幕的时间轴：id 用 state.id（接口要大小写正确的 BV 号，访客心跳里的是小写）
+  if (state.id && window.api.subtitleTime) {
+    window.api.subtitleTime({
+      id: state.id,
+      p: state.p,
+      found: !!v.found,
+      current: Number(v.current) || 0,
+      playing: !!v.playing,
+      rate: Number(v.rate) || 1
+    });
+  }
 
   if (v.found) hidePlaceholderIfVideo();
 

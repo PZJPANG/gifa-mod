@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>字幕</title>
+  <style>
+    :root {
+      --size: 30px;
+      --bg: rgba(0, 0, 0, 0.35);
+      --gold: #f5c451;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      overflow: hidden;
+      user-select: none;
+      font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    }
+    /* 字幕贴底向上长：两行时往上撑，不会把第一行挤出框 */
+    #box {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      align-items: center;
+      padding: 6px 10px;
+      box-sizing: border-box;
+    }
+    #text {
+      max-width: 100%;
+      text-align: center;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: var(--size);
+      line-height: 1.35;
+      font-weight: 600;
+      color: #fff;
+      background: var(--bg);
+      padding: 0.08em 0.45em;
+      border-radius: 0.25em;
+      -webkit-box-decoration-break: clone;
+      box-decoration-break: clone;
+      /* 八方向描边 + 柔影：雪地、天空这类亮底也看得清 */
+      text-shadow:
+        -1.5px -1.5px 0 #000, 1.5px -1.5px 0 #000, -1.5px 1.5px 0 #000, 1.5px 1.5px 0 #000,
+        0 -1.5px 0 #000, 0 1.5px 0 #000, -1.5px 0 0 #000, 1.5px 0 0 #000,
+        0 2px 6px rgba(0, 0, 0, 0.7);
+      transition: opacity 120ms ease;
+    }
+    #text.empty { opacity: 0; }
+    /* 提示语（预览 / 没字幕的原因）：小一号、偏金，和真字幕区分开 */
+    #text.hint { font-size: max(14px, calc(var(--size) * 0.6)); color: #ffe7a3; }
+
+    /* ---- 编辑模式：整块可拖，四边 + 右下角可缩放 ---- */
+    body.editing { -webkit-app-region: drag; cursor: move; }
+    body.editing #box {
+      outline: 2px dashed var(--gold);
+      outline-offset: -2px;
+      background: rgba(20, 20, 24, 0.35);
+    }
+    body.editing #text.empty { opacity: 0.85; }
+    #bar {
+      display: none;
+      position: absolute;
+      top: 6px;
+      left: 50%;
+      transform: translateX(-50%);
+      gap: 8px;
+      align-items: center;
+      padding: 3px 6px 3px 10px;
+      border-radius: 6px;
+      background: rgba(20, 20, 24, 0.85);
+      color: #ddd;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    body.editing #bar { display: flex; }
+    #bar button {
+      -webkit-app-region: no-drag;
+      cursor: pointer;
+      border: 0;
+      border-radius: 4px;
+      padding: 3px 10px;
+      font: inherit;
+      font-weight: 600;
+      color: #1b1b1b;
+      background: var(--gold);
+    }
+    .h { display: none; position: absolute; -webkit-app-region: no-drag; z-index: 2; }
+    body.editing .h { display: block; }
+    .h.n, .h.s { left: 10px; right: 10px; height: 8px; cursor: ns-resize; }
+    .h.n { top: 0; }
+    .h.s { bottom: 0; }
+    .h.e, .h.w { top: 10px; bottom: 10px; width: 8px; cursor: ew-resize; }
+    .h.e { right: 0; }
+    .h.w { left: 0; }
+    .h.se {
+      right: 0; bottom: 0; width: 16px; height: 16px; cursor: nwse-resize;
+      background: linear-gradient(135deg, transparent 50%, var(--gold) 50%);
+      border-bottom-right-radius: 2px;
+    }
+  </style>
+</head>
+<body>
+  <div id="box"><span id="text" class="empty"></span></div>
+  <div id="bar">
+    <span>拖动移动 · 拖边缘缩放 · 滚轮调字号</span>
+    <button id="btnLock">锁定</button>
+  </div>
+  <div class="h n" data-dir="n"></div>
+  <div class="h s" data-dir="s"></div>
+  <div class="h e" data-dir="e"></div>
+  <div class="h w" data-dir="w"></div>
+  <div class="h se" data-dir="se"></div>
+  <script src="./subtitle.js"></script>
+</body>
+</html>

@@ -34,6 +34,8 @@
       <symbol id="i-volume" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9z" /><path d="M17 9a4 4 0 010 6M19.5 6.5a7.5 7.5 0 010 11" /></symbol>
       <symbol id="i-resume" viewBox="0 0 24 24"><path d="M4 5v14l10-7zM17 5v14" /></symbol>
       <symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7.5" /><path d="M12 2.5v4M12 17.5v4M2.5 12h4M17.5 12h4" /></symbol>
+      <symbol id="i-danmaku" viewBox="0 0 24 24"><rect x="2.5" y="4.5" width="19" height="15" rx="2" /><path d="M9 9h9M5.5 12.5h8M11 16h7" /></symbol>
+      <symbol id="i-caption" viewBox="0 0 24 24"><rect x="2.5" y="5" width="19" height="14" rx="2" /><path d="M6 12h4M12 12h6M6 15.5h8M16 15.5h2" /></symbol>
     </svg>
 
     <div id="shell">
@@ -335,6 +337,130 @@
                 <p class="tip">
                   想压在原神上面：游戏内「显示模式」请选 <b>窗口化</b> 或 <b>无边框</b>。独占全屏下任何外部浮窗都无法被系统合成上去。
                 </p>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <span class="card-ico"><svg class="ico"><use href="#i-caption"></use></svg></span>
+                <div class="card-heading">
+                  <h2>游戏内字幕</h2>
+                  <p>把视频的 CC / AI 字幕单独叠在游戏画面上，视频缩小或隐藏也照样看得到</p>
+                </div>
+              </div>
+              <div class="card-body">
+                <label class="setting" for="setSubtitle">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-caption"></use></svg></span>
+                  <span class="setting-text"><strong>显示字幕</strong><small id="subStatus">跟着跟跑浮窗里正在播的视频走</small></span>
+                  <span class="switch"><input type="checkbox" id="setSubtitle" /></span>
+                </label>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-target"></use></svg></span>
+                  <span class="setting-text"><strong>位置与大小</strong><small>进入调整后，在屏幕上拖动字幕框、拖边缘缩放、滚轮调字号</small></span>
+                  <span class="setting-ctrl">
+                    <button id="btnSubMove" class="small">调整位置</button>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
+                  <span class="setting-text"><strong>字号</strong><small>字幕文字大小（像素）</small></span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setSubSize" min="14" max="72" step="1" />
+                    <span class="val" id="subSizeVal">30</span>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
+                  <span class="setting-text"><strong>底色</strong><small>字幕后面的半透明黑底，0 = 只留描边</small></span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setSubBg" min="0" max="90" step="1" />
+                    <span class="val" id="subBgVal">35%</span>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-caption"></use></svg></span>
+                  <span class="setting-text"><strong><label for="setSubLang">字幕语言</label></strong><small>视频有多条字幕时选一条；AI 字幕需要登录</small></span>
+                  <span class="setting-ctrl">
+                    <select id="setSubLang" class="sel">
+                      <option value="">自动（优先中文）</option>
+                    </select>
+                  </span>
+                </div>
+                <label class="setting" for="setAutoPause">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-clock"></use></svg></span>
+                  <span class="setting-text"><strong>说到「过完剧情」自动暂停</strong><small id="autoPauseHint">字幕里出现下面的关键词时，这句说完就暂停视频；自己过完剧情后按 Alt+空格 继续。不显示字幕也能用。</small></span>
+                  <span class="switch"><input type="checkbox" id="setAutoPause" /></span>
+                </label>
+                <div class="setting setting-stack">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-keyboard"></use></svg></span>
+                  <span class="setting-text"><strong><label for="setAutoPauseWords">暂停关键词</label></strong><small>用逗号分开；<b>*</b> 表示中间可以隔几个字，比如「过完*剧情」也能认出「过完这段剧情」。清空后回车恢复默认。</small></span>
+                  <div class="row" style="width: 100%; padding-left: 32px; box-sizing: border-box;">
+                    <input id="setAutoPauseWords" type="text" spellcheck="false" placeholder="过完*剧情, 剧情过完, 看完*剧情" />
+                  </div>
+                </div>
+                <p class="tip" id="subHotkeyHint">游戏里按 <b>Alt+C</b> 显示 / 隐藏字幕，<b>Alt+V</b> 调整位置 / 锁定；可在「快捷键」中修改。锁定后字幕鼠标穿透，不挡游戏操作。</p>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="card-head">
+                <span class="card-ico"><svg class="ico"><use href="#i-danmaku"></use></svg></span>
+                <div class="card-heading">
+                  <h2>全屏弹幕</h2>
+                  <p>像 B 站一样让弹幕在整块屏幕上飘过，鼠标穿透、跟着视频进度走</p>
+                </div>
+              </div>
+              <div class="card-body">
+                <label class="setting" for="setDanmaku">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-danmaku"></use></svg></span>
+                  <span class="setting-text"><strong>显示全屏弹幕</strong><small id="dmStatus">跟着跟跑浮窗里正在播的视频走</small></span>
+                  <span class="switch"><input type="checkbox" id="setDanmaku" /></span>
+                </label>
+                <label class="setting" for="setDmAvoidMap">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
+                  <span class="setting-text"><strong>避开小地图</strong><small>左上角小地图那一块不显示弹幕；位置跟「方位标定」里摆好的红圈走，没摆过按原神默认位置</small></span>
+                  <span class="switch"><input type="checkbox" id="setDmAvoidMap" /></span>
+                </label>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-window"></use></svg></span>
+                  <span class="setting-text"><strong><label for="setDmArea">显示区域</label></strong><small>只占屏幕上方的一部分，不挡画面中间</small></span>
+                  <span class="setting-ctrl">
+                    <select id="setDmArea" class="sel">
+                      <option value="0.25">上方 1/4</option>
+                      <option value="0.5">上方 1/2</option>
+                      <option value="0.75">上方 3/4</option>
+                      <option value="1">全屏</option>
+                    </select>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-clock"></use></svg></span>
+                  <span class="setting-text"><strong><label for="setDmSpeed">滚动速度</label></strong><small>一条弹幕横穿屏幕要几秒</small></span>
+                  <span class="setting-ctrl">
+                    <select id="setDmSpeed" class="sel">
+                      <option value="12">慢（12 秒）</option>
+                      <option value="8">适中（8 秒）</option>
+                      <option value="5">快（5 秒）</option>
+                    </select>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
+                  <span class="setting-text"><strong>字号</strong><small>弹幕文字大小（像素）</small></span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setDmSize" min="14" max="48" step="1" />
+                    <span class="val" id="dmSizeVal">25</span>
+                  </span>
+                </div>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-eye"></use></svg></span>
+                  <span class="setting-text"><strong>不透明度</strong><small>弹幕的可见程度</small></span>
+                  <span class="setting-ctrl">
+                    <input type="range" id="setDmOpacity" min="10" max="100" step="1" />
+                    <span class="val" id="dmOpacityVal">85%</span>
+                  </span>
+                </div>
+                <p class="tip" id="dmHotkeyHint">游戏里按 <b>Alt+D</b> 显示 / 隐藏弹幕；可在「快捷键」中修改。弹幕铺在主显示器上，打开大地图时嫌挡可以先按一下隐藏。</p>
               </div>
             </section>
 

@@ -27,6 +27,22 @@ contextBridge.exposeInMainWorld('api', {
   revealDump: () => ipcRenderer.invoke('overlay:reveal-dump'),
   onBearingState: (cb) => ipcRenderer.on('bearing:state', (_e, s) => cb(s)),
 
+  // 游戏内字幕：浮窗上报播放心跳（高频，单向 send）；启动器开关 / 调位置 / 调样式
+  subtitleTime: (payload) => ipcRenderer.send('subtitle:time', payload),
+  subtitleTracks: (payload) => ipcRenderer.send('subtitle:tracks', payload),
+  subtitleLive: (text) => ipcRenderer.send('subtitle:live', text),
+  subtitleEnable: (on) => ipcRenderer.invoke('subtitle:enable', on),
+  // 不传参数即切换；传布尔值是幂等设置
+  subtitleEdit: (on) => ipcRenderer.invoke('subtitle:edit', on),
+  subtitleStyle: (patch) => ipcRenderer.invoke('subtitle:style', patch),
+  subtitleState: () => ipcRenderer.invoke('subtitle:state'),
+  onSubtitleState: (cb) => ipcRenderer.on('subtitle:state', (_e, s) => cb(s)),
+
+  // 全屏弹幕
+  danmakuEnable: (on) => ipcRenderer.invoke('danmaku:enable', on),
+  danmakuStyle: (patch) => ipcRenderer.invoke('danmaku:style', patch),
+  danmakuState: () => ipcRenderer.invoke('danmaku:state'),
+  onDanmakuState: (cb) => ipcRenderer.on('danmaku:state', (_e, s) => cb(s)),
   // 输入状态：告诉主进程现在是不是在输入框里打字、是不是在录制新热键，
   // 这两段时间单键热键要让路，其余情况（包括窗口在前台）都该正常触发
   typing: (on) => ipcRenderer.send('ui:typing', !!on),

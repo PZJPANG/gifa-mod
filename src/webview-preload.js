@@ -2601,6 +2601,18 @@ function apply(msg) {
     setClean(!!msg.on);
     return;
   }
+  if (msg.cmd === 'subtitle-live') {
+    setSubtitleLive(!!msg.on);
+    return;
+  }
+  if (msg.cmd === 'subtitle-refresh') {
+    subGuest.reported = '';
+    for (const it of subGuest.info.values()) it.sent = '';
+    scheduleSubtitleProbe(0);
+    watchCcButton();
+    queueSubtitleFlush();
+    return;
+  }
   if (msg.cmd === 'bearing') {
     setBearing(msg);
     return;
@@ -2728,12 +2740,415 @@ function expandPlayer() {
   }, 1000);
 }
 
+/* ------------------------------------------- 游戏内字幕：字幕轨从页面里拿 */
+
+/**
+ * 字幕轨列表必须在 B 站页面里拿：只有这里的请求带着登录态 Cookie，
+ * AI 字幕（大多数攻略视频唯一的字幕）只给登录用户。主进程自己发请求时
+ * 常常被当成未登录，于是明明播放器里有 CC 按钮，主进程却说「没有字幕」。
+ *
+ * 三条路，按可靠程度排：
+ *  1. 旁听播放器自己的 x/player/(wbi/)v2 响应 —— 播放器拿到什么我们就拿到什么，零额外请求；
+ *  2. 播放器迟迟没发（或换 P 时没赶上），就用页面的 fetch 带 Cookie 主动问一次 x/player/v2；
+ *  3. 主进程连字幕正文都下不下来时，打开播放器自带的 CC，直接读屏幕上那一行字（实时文本兜底）。
+ *
+ * 这里只上报字幕轨（含 subtitle_url），字幕正文由主进程下载、按时间轴播放。
+ */
+
+const SUB_PLAYER_API = /\/\/api\.bilibili\.com\/x\/player\/(?:wbi\/)?v2\?/;
+// 新版播放器的字幕列表接口：返回 protobuf，player/v2 里的字幕列表已经常常是空的
+const SUB_VIEW_API = /\/\/api\.bilibili\.com\/x\/v2\/subtitle\/web\/view\?/;
+const subGuest = {
+  reported: '', // 主动请求用：这一集是否已经从播放器那里拿到过 player/v2
+  probeTimer: 0,
+  ccTimer: 0,
+  live: false,
+  liveTimer: 0,
+  lastLive: null,
+  ccTries: 0,
+  // 按集累积的情报：两个接口 + 有没有 CC 按钮，任何一项变了就合并上报一次
+  info: new Map(), // key -> { id, p, cid, player, view, hasCc, loggedIn, needLoginSubtitle, sent }
+  sendTimer: 0
+};
+
+/** 地址栏里的视频 id，保留大小写（接口要的是原样的 BV 号） */
+function videoIdExact() {
+  const m = /\/video\/(BV[0-9A-Za-z]{10}|av\d+)/i.exec(location.pathname);
+  return m ? m[1] : '';
+}
+
+function initialState() {
+  try {
+    return window.__INITIAL_STATE__ || null;
+  } catch {
+    return null;
+  }
+}
+
+/** 当前分 P 的 cid：优先按页码从分 P 列表里查（换 P 后 __INITIAL_STATE__.cid 可能还是旧的） */
+function currentCid() {
+  const st = initialState();
+  const p = partFromUrl(location.href) || 1;
+  const pages = (st && st.videoData && st.videoData.pages) || [];
+  const hit = pages.find((x) => x.page === p);
+  return (hit && hit.cid) || (st && st.cid) || (st && st.videoData && st.videoData.cid) || 0;
+}
+
+/** cid → 页码；查不到就当作地址栏里的那一 P */
+function partForCid(cid) {
+  const st = initialState();
+  const pages = (st && st.videoData && st.videoData.pages) || [];
+  const hit = cid && pages.find((x) => x.cid === cid);
+  return (hit && hit.page) || partFromUrl(location.href) || 1;
+}
+
+function subInfo(id, p) {
+  const key = `${id}#${p}`;
+  let it = subGuest.info.get(key);
+  if (!it) {
+    it = { id, p, cid: 0, player: null, view: null, hasCc: false, loggedIn: false, needLoginSubtitle: false, sent: '' };
+    subGuest.info.set(key, it);
+    if (subGuest.info.size > 10) subGuest.info.delete(subGuest.info.keys().next().value);
+  }
+  return it;
+}
+
+/** 合并上报（防抖 300ms）：新接口有轨就用新接口的，否则用 player/v2 的 */
+function flushSubtitleInfo() {
+  subGuest.sendTimer = 0;
+  for (const it of subGuest.info.values()) {
+    const subtitles = it.view && it.view.length ? it.view : it.player || [];
+    const payload = {
+      id: it.id,
+      p: it.p,
+      cid: it.cid,
+      loggedIn: it.loggedIn,
+      needLoginSubtitle: it.needLoginSubtitle,
+      hasCc: it.hasCc,
+      subtitles
+    };
+    const sig = JSON.stringify(payload);
+    if (sig === it.sent) continue;
+    it.sent = sig;
+    try {
+      ipcRenderer.sendToHost('subtitle-tracks', payload);
+    } catch {
+      /* 页面正在卸载 */
+    }
+  }
+}
+
+function queueSubtitleFlush() {
+  if (!subGuest.sendTimer) subGuest.sendTimer = setTimeout(flushSubtitleInfo, 300);
+}
+
+function normalizeSubList(list) {
+  return (Array.isArray(list) ? list : []).slice(0, 20).map((s) => ({
+    lan: String((s && s.lan) || ''),
+    lan_doc: String((s && s.lan_doc) || ''),
+    ai_type: Number(s && s.ai_type) || 0,
+    subtitle_url: String((s && s.subtitle_url) || '')
+  }));
+}
+
+/** x/player/(wbi/)v2 的 data */
+function reportPlayerData(data) {
+  if (!data || typeof data !== 'object') return;
+  const id = data.bvid || videoIdExact();
+  if (!id) return;
+  const cid = Number(data.cid) || 0;
+  const it = subInfo(id, partForCid(cid));
+  it.cid = cid || it.cid;
+  it.player = normalizeSubList(data.subtitle && data.subtitle.subtitles);
+  it.loggedIn = !!data.login_mid;
+  it.needLoginSubtitle = !!data.need_login_subtitle;
+  subGuest.reported = `${id}#${it.p}`;
+  queueSubtitleFlush();
+}
+
+function inspectPlayerResponse(url, text) {
+  if (!SUB_PLAYER_API.test(url)) return;
+  try {
+    const json = typeof text === 'string' ? JSON.parse(text) : text;
+    if (json && json.code === 0) reportPlayerData(json.data);
+  } catch {
+    /* 不是 JSON，忽略 */
+  }
+}
+
+/* ---- x/v2/subtitle/web/view 的 protobuf：不依赖具体 schema，按结构找「带字幕地址的那条消息」 ---- */
+
+const utf8 = new TextDecoder('utf-8', { fatal: true });
+
+function readVarint(b, pos) {
+  let v = 0;
+  let mul = 1;
+  for (let i = 0; i < 10; i += 1) {
+    if (pos >= b.length) return null;
+    const byte = b[pos++];
+    v += (byte & 0x7f) * mul;
+    if (!(byte & 0x80)) return { v, pos };
+    mul *= 128;
+  }
+  return null;
+}
+
+/** 解析一层 protobuf；不是合法消息就返回 null */
+function pbFields(b) {
+  const out = [];
+  let pos = 0;
+  while (pos < b.length) {
+    const tag = readVarint(b, pos);
+    if (!tag || tag.v < 8) return null;
+    pos = tag.pos;
+    const wire = tag.v % 8;
+    if (wire === 0) {
+      const n = readVarint(b, pos);
+      if (!n) return null;
+      pos = n.pos;
+      out.push({ no: Math.floor(tag.v / 8), num: n.v });
+    } else if (wire === 2) {
+      const len = readVarint(b, pos);
+      if (!len || len.pos + len.v > b.length) return null;
+      out.push({ no: Math.floor(tag.v / 8), bytes: b.subarray(len.pos, len.pos + len.v) });
+      pos = len.pos + len.v;
+    } else if (wire === 1) {
+      pos += 8;
+    } else if (wire === 5) {
+      pos += 4;
+    } else {
+      return null;
+    }
+    if (pos > b.length) return null;
+  }
+  return out;
+}
+
+function asText(bytes) {
+  if (!bytes.length || bytes.length > 2048) return null;
+  try {
+    const s = utf8.decode(bytes);
+    return /^[^\u0000-\u0008\u000e-\u001f]+$/.test(s) ? s : null;
+  } catch {
+    return null;
+  }
+}
+
+const SUB_URL_RE = /^(?:https?:)?\/\/\S*(?:subtitle|bfs)\S*$/i;
+const LAN_RE = /^(?:ai-)?[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$/;
+
+/** 递归找：某条消息的直接字符串字段里有一个像字幕地址 → 当作一条字幕轨 */
+function collectPbTracks(b, depth, out) {
+  if (depth > 6 || out.length >= 20) return;
+  const fields = pbFields(b);
+  if (!fields) return;
+  const texts = [];
+  for (const f of fields) {
+    if (!f.bytes) continue;
+    const s = asText(f.bytes);
+    // 嵌套消息偶尔也能解成「文字」（标签字节恰好落在 \t\n\r 上），带这些控制符的两边都试
+    const plain = s !== null && !/[\t\n\r\v\f]/.test(s);
+    if (plain) texts.push(s);
+    else collectPbTracks(f.bytes, depth + 1, out);
+  }
+  const url = texts.find((s) => SUB_URL_RE.test(s));
+  if (!url) return;
+  const lan = texts.find((s) => LAN_RE.test(s)) || '';
+  const name = texts.find((s) => s !== url && s !== lan && /[^\x00-\x7f]/.test(s)) || lan || '字幕';
+  out.push({ lan, lan_doc: name, ai_type: /^ai-/.test(lan) || /aisubtitle/i.test(url) ? 1 : 0, subtitle_url: url });
+}
+
+async function inspectSubtitleView(url) {
+  try {
+    const u = new URL(url, location.href);
+    const cid = Number(u.searchParams.get('oid')) || 0;
+    const res = await fetch(u.href, { credentials: 'include' });
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const tracks = [];
+    collectPbTracks(buf, 0, tracks);
+    const id = videoIdExact();
+    if (!id) return;
+    const it = subInfo(id, partForCid(cid));
+    it.cid = cid || it.cid;
+    it.view = tracks;
+    queueSubtitleFlush();
+  } catch {
+    /* 解析不了就只靠 player/v2 和 CC 按钮 */
+  }
+}
+
+/**
+ * 播放器 CC 菜单「主字幕」里的语言项。注意 CC 按钮本身不能当证据：
+ * 没字幕、没登录时它也在（里面挂着「AI 配音 / 翻译」菜单，主字幕区显示「暂无字幕」）。
+ * 菜单是第一次悬停时才生成的。
+ */
+function playerSubtitleItems() {
+  return [
+    ...document.querySelectorAll('.bpx-player-ctrl-subtitle-major-inner > *, .bpx-player-ctrl-subtitle-language-item')
+  ].filter((el, i, all) => all.indexOf(el) === i && (el.textContent || '').trim());
+}
+
+function hoverCcMenu(on) {
+  const btn = document.querySelector('.bpx-player-ctrl-subtitle');
+  if (btn) btn.dispatchEvent(new MouseEvent(on ? 'mouseenter' : 'mouseleave', { bubbles: true }));
+  return !!btn;
+}
+
+/** 播放器主字幕里有语言项 = 这一集确实有字幕（哪怕接口没给出能下载的地址），主进程据此走实时模式 */
+function watchCcButton() {
+  clearInterval(subGuest.ccTimer);
+  let ticks = 0;
+  let hovering = false;
+  subGuest.ccTimer = setInterval(() => {
+    ticks += 1;
+    const id = videoIdExact();
+    if (hovering) {
+      hoverCcMenu(false);
+      hovering = false;
+    }
+    if (!id || ticks > 40) {
+      clearInterval(subGuest.ccTimer);
+      return;
+    }
+    if (playerSubtitleItems().length) {
+      const it = subInfo(id, partFromUrl(location.href) || 1);
+      if (!it.hasCc) {
+        it.hasCc = true;
+        queueSubtitleFlush();
+      }
+      clearInterval(subGuest.ccTimer);
+      return;
+    }
+    // 字幕列表是异步到的：隔一阵悬停一下，让菜单生成 / 刷新
+    if (ticks % 10 === 3) hovering = hoverCcMenu(true);
+  }, 1000);
+}
+
+// 旁听播放器的请求：只读响应副本，绝不改动请求本身，出任何错都吞掉
+try {
+  const nativeFetch = window.fetch;
+  if (typeof nativeFetch === 'function') {
+    window.fetch = function gifaFetch(input, init) {
+      const result = nativeFetch.apply(this, arguments);
+      try {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        if (SUB_VIEW_API.test(url)) setTimeout(() => inspectSubtitleView(url), 0);
+        if (SUB_PLAYER_API.test(url)) {
+          result
+            .then((res) => res.clone().text())
+            .then((text) => inspectPlayerResponse(url, text))
+            .catch(() => {});
+        }
+      } catch {
+        /* ignore */
+      }
+      return result;
+    };
+  }
+  const nativeOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function gifaOpen(method, url) {
+    try {
+      const u = String(url || '');
+      if (SUB_VIEW_API.test(u)) setTimeout(() => inspectSubtitleView(new URL(u, location.href).href), 0);
+      if (SUB_PLAYER_API.test(u)) {
+        this.addEventListener('load', () => {
+          try {
+            const body = this.responseType === 'json' ? this.response : this.responseText;
+            inspectPlayerResponse(u, body);
+          } catch {
+            /* ignore */
+          }
+        });
+      }
+    } catch {
+      /* ignore */
+    }
+    return nativeOpen.apply(this, arguments);
+  };
+} catch {
+  /* 改写失败只是少一条来源，主动请求那条路还在 */
+}
+
+/** 播放器没发、或发早了没赶上，就主动问一次（带页面 Cookie） */
+async function probeSubtitleTracks() {
+  const id = videoIdExact();
+  const p = partFromUrl(location.href) || 1;
+  if (!id || subGuest.reported === `${id}#${p}`) return;
+  const cid = currentCid();
+  if (!cid) return;
+  const idParam = /^av/i.test(id) ? `aid=${id.slice(2)}` : `bvid=${id}`;
+  try {
+    const res = await fetch(`https://api.bilibili.com/x/player/v2?${idParam}&cid=${cid}`, { credentials: 'include' });
+    const json = await res.json();
+    if (json && json.code === 0) reportPlayerData(json.data);
+  } catch {
+    /* 网络问题：主进程那边还有自己的兜底 */
+  }
+}
+
+function scheduleSubtitleProbe(delay) {
+  clearTimeout(subGuest.probeTimer);
+  subGuest.probeTimer = setTimeout(probeSubtitleTracks, delay);
+}
+
+/* ---- 实时文本兜底：读播放器画在屏幕上的那一行字幕 ---- */
+
+function readPlayerSubtitleText() {
+  const parts = document.querySelectorAll('.bpx-player-subtitle-panel-text');
+  if (parts.length) return [...parts].map((e) => e.textContent.trim()).filter(Boolean).join('\n');
+  const wrap = document.querySelector('.bpx-player-subtitle-wrap');
+  return wrap ? wrap.textContent.trim() : '';
+}
+
+/** 打开播放器自带的 CC：菜单还没生成就先悬停一下，下一轮再点中文那一项 */
+function turnOnPlayerCc() {
+  const items = playerSubtitleItems();
+  if (!items.length) {
+    hoverCcMenu(true);
+    return false;
+  }
+  hoverCcMenu(false);
+  const active = (el) => el.classList.contains('bpx-state-active') || !!el.querySelector('.bpx-state-active');
+  if (items.some(active)) return true;
+  const label = (el) => `${el.getAttribute('data-lan') || ''} ${el.textContent || ''}`;
+  const zh = items.find((el) => /zh|中文/i.test(label(el)));
+  (zh || items[0]).click();
+  return true;
+}
+
+function tickSubtitleLive() {
+  if (subGuest.ccTries < 20 && !readPlayerSubtitleText()) {
+    if (turnOnPlayerCc()) subGuest.ccTries = 20;
+    else subGuest.ccTries += 1;
+  }
+  const text = readPlayerSubtitleText();
+  if (text === subGuest.lastLive) return;
+  subGuest.lastLive = text;
+  try {
+    ipcRenderer.sendToHost('subtitle-live', text);
+  } catch {
+    /* 页面正在卸载 */
+  }
+}
+
+function setSubtitleLive(on) {
+  subGuest.live = on;
+  clearInterval(subGuest.liveTimer);
+  subGuest.liveTimer = 0;
+  subGuest.lastLive = null;
+  subGuest.ccTries = 0;
+  if (on) subGuest.liveTimer = setInterval(tickSubtitleLive, 250);
+}
+
 /* ---------------------------------------------------------------- 启动 */
 
 function boot() {
   bind(pickVideo());
   if (videoOnly) setVideoOnly(true);
   if (cleanOn) setClean(cleanOn);
+  // 给播放器 2.5 秒自己去请求字幕轨，没等到再主动问；同时盯 CC 按钮
+  scheduleSubtitleProbe(2500);
+  watchCcButton();
 
   // 自动连播下一 P 时 ?p= 会变，但不一定伴随视频事件（也可能整页导航）。
   // 单独轮询地址栏，变了就立刻把新页码推给浮窗；整页导航则由新 preload 的
@@ -2743,6 +3158,9 @@ function boot() {
     if (location.href === lastHref) return;
     lastHref = location.href;
     push(true);
+    // 换 P / 换片（SPA）：新一集的字幕轨同样先等播放器，没等到再主动问
+    scheduleSubtitleProbe(2500);
+    watchCcButton();
   }, 500);
 
   // B 站是 SPA，切 P / 换片会重建 <video>，持续轮询兜底
