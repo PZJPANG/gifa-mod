@@ -467,12 +467,15 @@ function ensureWorker() {
       locate.armed = !!m.active;
       const had = !!locate.memory;
       locate.memory = m.target || null;
-      locate.diag.memory = m.target ? `${m.held ? 'held' : 'ok'} ${m.ncc}` : m.arrived ? 'arrived' : m.lost ? 'lost' : m.expired ? 'expired' : 'none';
+      locate.diag.memory = m.target
+        ? `${m.held ? 'held' : 'ok'} ${m.ncc}`
+        : m.arrived ? 'arrived' : m.lost ? 'lost' : m.expired ? 'expired' : m.hidden ? `hidden ${m.ncc}` : 'none';
       if (had || locate.memory) draw();
       if (!locate.dot) {
         if (locate.memory) setLocateStatus('memory');
+        else if (m.hidden) setLocateStatus('memhold');
         else if (m.arrived) setLocateStatus('arrived');
-        else if (locate.status === 'memory') setLocateStatus('waiting');
+        else if (locate.status === 'memory' || locate.status === 'memhold') setLocateStatus('waiting');
       }
       return;
     }
@@ -515,7 +518,9 @@ function ensureWorker() {
     }
     if (had || locate.dot) draw();
     if (!m.dot && locate.memory) setLocateStatus('memory');
-    else setLocateStatus(m.dot ? 'tracking' : m.locked ? 'searching' : 'learning', m.locked ? { scale: m.scale } : null);
+    else if (!m.dot && locate.status === 'memhold') {
+      /* 记忆还在、只是暂时对不上：保持这个提示 */
+    } else setLocateStatus(m.dot ? 'tracking' : m.locked ? 'searching' : 'learning', m.locked ? { scale: m.scale } : null);
   };
   w.onerror = (e) => {
     locate.busy = false;

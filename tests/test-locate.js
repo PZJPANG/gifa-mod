@@ -290,17 +290,28 @@ console.log(`speed: ${(timeMs / timedFrames).toFixed(1)} ms per tracking update 
   console.log(`last-seen marker: ${ok}/${judged} frames within 2.5px (max error ${maxErr.toFixed(1)}px), arrival detected in every run`);
   assert(ok >= 0.9 * judged, 'marker should stay on the guide\'s last spot while you walk');
 
-  // teleport / totally different place: tracking is lost and the marker goes away (no stale guess forever)
+  // teleport / totally different place: the marker is hidden within ~2 s, never jumps to a wrong place,
+  // and the memory is dropped after a minute of not matching
   const L3 = L.createLastSeen();
   L3.setAnchor(sampler({ x: 400, y: 400 }), { x: 10, y: 5 }, 0);
-  let gone = false;
-  for (let f = 1; f <= 30 && !gone; f++) {
+  let hiddenAt = -1;
+  for (let f = 1; f <= 30; f++) {
     const r = L3.track(sampler({ x: 800, y: 200 }), N, R, f * 300);
     if (process.env.LOCATE_DEBUG) console.log(`    teleport f${f} held ${r.held} ncc ${(r.ncc || 0).toFixed(2)}`);
-    gone = !r.target;
+    if (r.target) assert(r.held, 'after a teleport the marker must never be re-placed from a false match');
+    if (!r.target && hiddenAt < 0) hiddenAt = f;
   }
-  assert(gone && !L3.active, 'after a teleport the marker must disappear');
-  console.log('last-seen: teleport clears the marker');
+  assert(hiddenAt > 0 && hiddenAt * 300 <= 2400, 'after a teleport the marker must be hidden quickly');
+  assert(L3.active, 'memory kept for a while (menus / dialogue also make the minimap unmatchable)');
+  L3.track(sampler({ x: 800, y: 200 }), N, R, 70000);
+  assert(!L3.active, 'memory dropped after a minute without a match');
+  // ...but coming back to where you were brings the marker back
+  const L4 = L.createLastSeen();
+  L4.setAnchor(sampler({ x: 400, y: 400 }), { x: 10, y: 5 }, 0);
+  for (let f = 1; f <= 10; f++) L4.track(sampler({ x: 800, y: 200 }), N, R, f * 300);
+  const back = L4.track(sampler({ x: 400, y: 400 }), N, R, 3500);
+  assert(back.target && Math.hypot(back.target.x - 10, back.target.y - 5) < 2, 'marker returns once your minimap matches again');
+  console.log('last-seen: teleport hides the marker, menus/dialogue keep the memory');
 }
 
 /* ---- 6. speed (what one tracking update costs; the overlay runs ~4 per second) ---- */

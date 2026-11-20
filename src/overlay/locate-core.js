@@ -560,7 +560,10 @@
     const minMargin = opts.minMargin ?? 0.12;
     const reanchorR = opts.reanchor ?? 0.45;
     const arriveR = opts.arrive ?? 0.15;
-    const lostMs = opts.lostMs ?? 4000;
+    // 对不上：1.5 秒内沿用上一个位置；之后先不画（打开菜单 / 剧情对话 / 读条时你的小地图会变样），
+    // 但锚点留着，回到原处又能对上就接着画；60 秒都对不上（传送走了）才真正丢掉
+    const hideMs = opts.hideMs ?? 1500;
+    const lostMs = opts.lostMs ?? 60000;
     const stepR = opts.step ?? 0.2; // 两帧之间最多挪多远（小地图半径的比例）还算「连贯」
     const contNcc = opts.contNcc ?? 0.75;
     const maxAgeMs = opts.maxAgeMs ?? 15 * 60 * 1000;
@@ -614,12 +617,14 @@
           }
           return { target: t, held: false, ncc: res.ncc };
         }
-        // 这一帧没对上（转镜头时视锥扫过、打开菜单……）：先沿用上一个位置，太久对不上就放弃
+        // 这一帧没对上（转镜头时视锥扫过、打开菜单……）：先沿用上一个位置，久了先藏起来，太久才放弃
         if (!anchor.lostSince) anchor.lostSince = now;
-        if (now - anchor.lostSince > lostMs) {
+        const gap = now - anchor.lostSince;
+        if (gap > lostMs) {
           clear();
           return { target: null, lost: true };
         }
+        if (gap > hideMs) return { target: null, hidden: true, ncc: res.ncc };
         return { target: last, held: true, ncc: res.ncc };
       }
     };

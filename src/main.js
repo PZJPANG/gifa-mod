@@ -880,6 +880,10 @@ function createWindow() {
     resetDanmaku();
     notifyFloatState();
   });
+
+  // 关掉浮窗时叠加层（红圈）会被一起销毁；重新开浮窗（换视频）时要把它带回来，
+  // 否则方位箭头 / 博主位置点整个停掉（原版只在程序启动时创建一次）
+  if (settings.bearing.enabled) showOverlay();
 }
 
 /* ---------------------------------------------------------------- 启动器 */

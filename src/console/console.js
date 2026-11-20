@@ -663,6 +663,7 @@ function renderLocateState(s) {
         tracking: `正在跟踪${ratio}：黄点就是博主的位置`,
         memory: '博主的小地图不见了（进任务 / 过场 / 暂停）：空心圈标着他最后出现的位置，走到那里会自动消失；在小地图外时红圈边上的小三角指向那边',
         arrived: '你已经走到博主最后出现的位置了',
+        memhold: '记着博主最后出现的位置，但你的小地图暂时对不上（打开了菜单 / 对话 / 读条？）；小地图恢复后空心圈会再出现，60 秒都对不上就放弃',
         error: `截屏失败：${s.message || '未知错误'}`
       }[s.status] || '准备中…';
   $('locateStatus').textContent = text;

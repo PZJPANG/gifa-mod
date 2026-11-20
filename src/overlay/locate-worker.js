@@ -43,6 +43,7 @@ function postMemory(res, now, done = false) {
     held: !!res.held,
     arrived: !!res.arrived,
     lost: !!res.lost,
+    hidden: !!res.hidden,
     expired: !!res.expired,
     ncc: res.ncc != null ? +res.ncc.toFixed(3) : null,
     now
