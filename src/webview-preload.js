@@ -2549,20 +2549,46 @@ function setBearing(cfg = {}) {
 const LOCATE_N = 128;
 const LOCATE_R = 40;
 let locateTimer = 0;
+let locateDiagTimer = 0;
 let locateCanvas = null;
+// 诊断计数：每 2 秒报一次「为什么发了 / 为什么没发」，排查「一直等不到点」用
+const locateDiag = { sent: 0, noVideo: 0, paused: 0, noMap: 0, edge: 0, readFail: 0 };
 
 function syncLocatePatches() {
   const want = !!(BEARING.enabled && BEARING.locate);
-  if (want && !locateTimer) locateTimer = setInterval(sendLocatePatch, 250);
-  else if (!want && locateTimer) {
+  if (want && !locateTimer) {
+    locateTimer = setInterval(sendLocatePatch, 250);
+    locateDiagTimer = setInterval(reportLocateDiag, 2000);
+  } else if (!want && locateTimer) {
     clearInterval(locateTimer);
+    clearInterval(locateDiagTimer);
     locateTimer = 0;
+    locateDiagTimer = 0;
   }
+}
+
+function reportLocateDiag() {
+  const m = BEARING.mapSeen;
+  try {
+    ipcRenderer.sendToHost('locate-diag', {
+      ...locateDiag,
+      rois: BEARING.rois.length,
+      bearingOn: !!BEARING.enabled,
+      loop: BEARING.loopKind || '',
+      mapSeenAgoMs: m ? Date.now() - m.at : -1,
+      video: video ? `${video.videoWidth}x${video.videoHeight}${video.paused ? ' paused' : ''}` : 'none'
+    });
+  } catch {
+    /* 页面正在卸载 */
+  }
+  for (const k of Object.keys(locateDiag)) locateDiag[k] = 0;
 }
 
 function sendLocatePatch() {
   const m = BEARING.mapSeen;
-  if (!video || video.paused || !video.videoWidth || !m || Date.now() - m.at > 800) return;
+  if (!video || !video.videoWidth) return void (locateDiag.noVideo += 1);
+  if (video.paused) return void (locateDiag.paused += 1);
+  if (!m || Date.now() - m.at > 800) return void (locateDiag.noMap += 1);
   const vw = video.videoWidth;
   const vh = video.videoHeight;
   const mapR = m.roi.r * vw;
@@ -2570,7 +2596,7 @@ function sendLocatePatch() {
   const cy = m.roi.cy * vh + (m.ty || 0);
   const want = 1.6 * mapR; // 切片半边对应的视频像素
   const half = Math.min(want, cx, vw - cx, cy, vh - cy);
-  if (half < 0.5 * mapR) return; // 小地图大半在画面外，不够比
+  if (half < 0.5 * mapR) return void (locateDiag.edge += 1); // 小地图大半在画面外，不够比
   const k = LOCATE_N / 2 / want; // 切片像素 / 视频像素
   if (!locateCanvas) {
     locateCanvas = document.createElement('canvas');
@@ -2585,8 +2611,10 @@ function sendLocatePatch() {
     ctx.drawImage(video, cx - half, cy - half, 2 * half, 2 * half, LOCATE_N / 2 - d, LOCATE_N / 2 - d, 2 * d, 2 * d);
     data = ctx.getImageData(0, 0, LOCATE_N, LOCATE_N).data;
   } catch {
+    locateDiag.readFail += 1;
     return; // 画面跨域等原因读不到像素
   }
+  locateDiag.sent += 1;
   const gray = new Uint8Array(LOCATE_N * LOCATE_N);
   const skip = new Uint8Array(LOCATE_N * LOCATE_N);
   for (let i = 0, p = 0; i < gray.length; i += 1, p += 4) {

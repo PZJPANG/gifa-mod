@@ -642,11 +642,20 @@ async function syncPlaceButton() {
 function renderLocateState(s) {
   if (!s) return;
   const ratio = s.scale ? `（缩放 ×${s.scale.toFixed(2)}）` : '';
+  // 等待中时主进程会附带「卡在哪一段」
+  const waitReason = {
+    'video-paused': '视频暂停中',
+    'video-no-map': '视频里的小地图还没被识别（红箭头也不会动）：先在本页点「① 框选视频里的小地图」，每个视频要框一次',
+    'video-edge': '框选的小地图大半在视频画面外，请重新「① 框选」',
+    'video-read': '读不到视频画面的像素',
+    'main-drop': '内部转发失败，请把 data\\locate-debug.log 发给开发者',
+    'no-capture': '截屏还没准备好'
+  }[s.reason];
   const text = !s.enabled
     ? '把视频里的小地图和你的小地图比对，在你的小地图上用黄点标出博主站在哪；只有你跟在路线附近时才会出现'
     : {
         off: '已关闭',
-        waiting: '等视频播放、画面里出现小地图…',
+        waiting: waitReason || '等视频播放、画面里出现小地图…',
         learning: '正在学习博主小地图的缩放比例：跟着路线走几步，学好后自动出现黄点（这个视频只需学一次）',
         searching: `比例已学好${ratio}，但你现在不在博主的路线附近`,
         tracking: `正在跟踪${ratio}：黄点就是博主的位置`,

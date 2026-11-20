@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('api', {
   bearing: (payload) => ipcRenderer.send('overlay:bearing', payload),
   // 视频角色定位：博主小地图切片（每秒约 4 次，单向 send）
   minimapPatch: (payload) => ipcRenderer.send('locate:patch', payload),
+  locateDiag: (payload) => ipcRenderer.send('locate:diag', payload),
   locateState: () => ipcRenderer.invoke('locate:state'),
   onLocateState: (cb) => ipcRenderer.on('locate:state', (_e, s) => cb(s)),
   overlayEnable: (on) => ipcRenderer.invoke('overlay:enable', on),

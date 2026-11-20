@@ -1259,6 +1259,57 @@ async function sendLocateConfig(reset) {
   });
 }
 
+/**
+ * 诊断日志：data\locate-debug.log，每 2 秒一行 JSON，把三段链路放在一起：
+ *   video   视频页面：发了几张切片、没发的原因（暂停 / 没认出小地图 / 小地图贴边…）
+ *   main    主进程：收到几张、转给叠加层几张、丢弃原因
+ *   overlay 叠加层：收到几张、截屏是否就绪、交给后台线程几次、算完几次、耗时、错误
+ * 文件超过 300KB 就滚动成 .old，不会无限长大。
+ */
+const locateDbg = { fromVideo: 0, forwarded: 0, drop: { disabled: 0, bad: 0, noOverlay: 0, newVideo: 0 }, overlay: null };
+
+function writeLocateLog(videoDiag) {
+  const line = {
+    t: new Date().toISOString(),
+    locateOn: locateEnabled(),
+    bearingOn: !!settings.bearing.enabled,
+    overlay: overlayWin && !overlayWin.isDestroyed() ? (overlayWin.isVisible() ? 'visible' : 'hidden') : 'none',
+    key: locateKey,
+    savedScale: (settings.bearing.locateScaleBy || {})[locateKey] || 0,
+    status: locateStatus.status,
+    video: videoDiag,
+    main: { fromVideo: locateDbg.fromVideo, forwarded: locateDbg.forwarded, drop: locateDbg.drop },
+    overlayDiag: locateDbg.overlay
+  };
+  locateDbg.fromVideo = 0;
+  locateDbg.forwarded = 0;
+  locateDbg.drop = { disabled: 0, bad: 0, noOverlay: 0, newVideo: 0 };
+  locateDbg.overlay = null;
+  locateDbg.lastVideo = videoDiag;
+  try {
+    const file = path.join(app.getPath('userData'), 'locate-debug.log');
+    try {
+      if (fs.statSync(file).size > 300 * 1024) fs.renameSync(file, file + '.old');
+    } catch {
+      /* 还没有文件 */
+    }
+    fs.appendFileSync(file, JSON.stringify(line) + '\n', 'utf8');
+  } catch {
+    /* 写不了日志不影响功能 */
+  }
+  // 「一直在等」时，把卡在哪一段直接告诉启动器
+  if (locateEnabled() && (!locateStatus.status || locateStatus.status === 'waiting')) {
+    let reason = '';
+    if (videoDiag.paused && !videoDiag.sent) reason = 'video-paused';
+    else if (videoDiag.noMap && !videoDiag.sent) reason = 'video-no-map';
+    else if (videoDiag.edge && !videoDiag.sent) reason = 'video-edge';
+    else if (videoDiag.readFail && !videoDiag.sent) reason = 'video-read';
+    else if (videoDiag.sent && !line.main.forwarded) reason = 'main-drop';
+    else if (line.overlayDiag && line.overlayDiag.noCapture) reason = 'no-capture';
+    sendTo(consoleWin, 'locate:state', { ...locateStatus, enabled: true, reason });
+  }
+}
+
 function setLocateEnabled(on) {
   settings.bearing.locate = !!on;
   persist();
@@ -2374,14 +2425,27 @@ function registerIpc() {
   // 浮窗页面送来的博主小地图切片：换视频了先让叠加层重置（带上这个视频之前学到的比例），再转过去
   ipcMain.on('locate:patch', (event, p) => {
     if (!win || win.isDestroyed() || event.sender !== win.webContents) return;
-    if (!locateEnabled() || !p || !p.gray || !overlayWin || overlayWin.isDestroyed()) return;
+    locateDbg.fromVideo += 1;
+    if (!locateEnabled()) return void (locateDbg.drop.disabled += 1);
+    if (!p || !p.gray) return void (locateDbg.drop.bad += 1);
+    if (!overlayWin || overlayWin.isDestroyed()) return void (locateDbg.drop.noOverlay += 1);
     const key = String(p.id || p.vid || '');
     if (key !== locateKey) {
       locateKey = key;
       sendLocateConfig(true);
-      return;
+      return void (locateDbg.drop.newVideo += 1);
     }
     overlayWin.webContents.send('locate:patch', p);
+    locateDbg.forwarded += 1;
+  });
+  // 诊断：视频页面每 2 秒报一次（为什么发 / 没发切片），叠加层同样报一次；合起来写进 data\locate-debug.log
+  ipcMain.on('locate:diag', (event, d) => {
+    if (!win || win.isDestroyed() || event.sender !== win.webContents || !d) return;
+    writeLocateLog(d);
+  });
+  ipcMain.on('locate:odiag', (event, d) => {
+    if (!overlayWin || overlayWin.isDestroyed() || event.sender !== overlayWin.webContents || !d) return;
+    locateDbg.overlay = d;
   });
   // 叠加层第一次锁定了这个视频的缩放比例：存下来，下次打开这个视频直接用
   ipcMain.on('locate:learned', (event, scale) => {

@@ -326,7 +326,9 @@ const locate = {
   lastPatchAt: 0,
   lastResult: null,
   status: '',
-  tick: 0
+  tick: 0,
+  // 诊断计数（每 2 秒上报一次，写进 data\locate-debug.log）
+  diag: { patchesIn: 0, noCapture: 0, busy: 0, framesOut: 0, results: 0, lastMs: 0, maxMs: 0, error: '' }
 };
 
 // 博主小地图切片里，小地图半径 = patch.R 像素；dot 坐标单位相同（比例 1 下）
@@ -424,6 +426,9 @@ function ensureWorker() {
     if (m.type !== 'result') return;
     locate.busy = false;
     locate.lastResult = m;
+    locate.diag.results += 1;
+    locate.diag.lastMs = Math.round(m.ms || 0);
+    locate.diag.maxMs = Math.max(locate.diag.maxMs, locate.diag.lastMs);
     const had = !!locate.dot;
     locate.dot = m.dot;
     if (had || locate.dot) draw();
@@ -431,6 +436,7 @@ function ensureWorker() {
   };
   w.onerror = (e) => {
     locate.busy = false;
+    locate.diag.error = `worker: ${e.message || 'error'}`;
     setLocateStatus('error', { message: e.message || 'worker error' });
   };
   locate.worker = w;
@@ -441,9 +447,11 @@ function ensureWorker() {
 async function onLocatePatch(patch) {
   if (!locate.enabled || placing || !patch || !patch.gray) return;
   locate.lastPatchAt = Date.now();
+  locate.diag.patchesIn += 1;
   const v = locate.video;
   const d = locate.display;
-  if (!v || !d || !v.videoWidth || locate.busy) return;
+  if (!v || !d || !v.videoWidth) return void (locate.diag.noCapture += 1);
+  if (locate.busy) return void (locate.diag.busy += 1);
   const k = v.videoWidth / d.width; // 截屏像素 / 屏幕逻辑像素
   const ringR = radius(window.innerWidth, window.innerHeight);
   const centre = {
@@ -464,11 +472,32 @@ async function onLocatePatch(patch) {
       { type: 'frame', patch, bitmap, origin: { x: x0, y: y0 }, centre, ringR: ringRs, now: Date.now() },
       [bitmap]
     );
+    locate.diag.framesOut += 1;
+    locate.diag.geom = `ring ${ringRs.toFixed(0)}px @${centre.x.toFixed(0)},${centre.y.toFixed(0)} crop ${x1 - x0}x${y1 - y0}`;
   } catch (err) {
     locate.busy = false;
+    locate.diag.error = String((err && err.message) || err);
     setLocateStatus('error', { message: String((err && err.message) || err) });
   }
 }
+
+setInterval(() => {
+  if (!locate.enabled && !locate.diag.patchesIn) return;
+  const v = locate.video;
+  window.overlayApi.locateDiag({
+    ...locate.diag,
+    enabled: locate.enabled,
+    capture: v ? `${v.videoWidth}x${v.videoHeight}` : 'none',
+    display: locate.display ? `${locate.display.width}x${locate.display.height}@${locate.display.x},${locate.display.y}` : 'none',
+    win: `${window.screenX},${window.screenY} ${window.innerWidth}x${window.innerHeight}`,
+    status: locate.status,
+    locked: !!(locate.lastResult && locate.lastResult.locked),
+    scale: locate.lastResult ? locate.lastResult.scale : 0,
+    trusted: !!(locate.lastResult && locate.lastResult.trusted),
+    dot: !!locate.dot
+  });
+  locate.diag = { patchesIn: 0, noCapture: 0, busy: 0, framesOut: 0, results: 0, lastMs: 0, maxMs: 0, error: '' };
+}, 2000);
 
 window.overlayApi.onLocatePatch((p) => {
   onLocatePatch(p);

@@ -165,6 +165,10 @@ function createWebview() {
       if (window.api.minimapPatch) window.api.minimapPatch({ ...(e.args && e.args[0]), id: state.id });
       return;
     }
+    if (e.channel === 'locate-diag') {
+      if (window.api.locateDiag) window.api.locateDiag({ ...(e.args && e.args[0]), id: state.id });
+      return;
+    }
     if (e.channel === 'subtitle-live') {
       if (window.api.subtitleLive) window.api.subtitleLive(String((e.args && e.args[0]) || ''));
       return;
