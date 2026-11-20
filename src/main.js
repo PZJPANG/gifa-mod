@@ -23,6 +23,7 @@ const {
   crossedPauseCue
 } = require('./subtitle-source');
 const { createScreenGrabber } = require('./screen-grab');
+const { createTurnDetector } = require('./turn-detect');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -503,6 +504,13 @@ const DEFAULT_SETTINGS = {
     duration: 8, // 一条滚动弹幕横穿屏幕的秒数，越小越快
     area: 0.5, // 只占屏幕上方这么大的比例，免得挡住游戏中间
     avoidMap: true // 小地图那一块不画弹幕（位置跟「方位标定」里摆好的红圈走）
+  },
+  // 转向提醒：博主左转 / 右转 / 掉头时，屏幕上弹一个大箭头（靠红箭头那一路行进方向判断）
+  turn: {
+    enabled: true,
+    minTurn: 60, // 方向变化至少这么多度才算转弯
+    x: null,
+    y: null
   }
 };
 
@@ -620,7 +628,8 @@ function loadSettings() {
             ? parseKeywordText(raw.autoPause.keywords.join(','))
             : DEFAULT_PAUSE_KEYWORDS.slice()
       },
-      danmaku: { ...DEFAULT_SETTINGS.danmaku, ...(raw.danmaku || {}) }
+      danmaku: { ...DEFAULT_SETTINGS.danmaku, ...(raw.danmaku || {}) },
+      turn: { ...DEFAULT_SETTINGS.turn, ...(raw.turn || {}) }
     };
     // 已移除的 BetterGI 联动留下的旧设置，别再写回文件
     delete settings.bgi;
@@ -1027,7 +1036,7 @@ function createConsole() {
     // 屏幕上、进程也不退出，用户还得再去任务栏手动关一次。
     if (quittingFromConsole) return;
     quittingFromConsole = true;
-    for (const w of [win, overlayWin, subWin, dmWin, loginWin]) {
+    for (const w of [win, overlayWin, subWin, dmWin, turnWin, loginWin]) {
       try {
         if (w && !w.isDestroyed()) w.destroy();
       } catch (err) {
@@ -1275,7 +1284,7 @@ function locateEnabled() {
 
 function applyCaptureProtection() {
   const on = locateEnabled();
-  for (const w of [overlayWin, subWin, dmWin, win]) {
+  for (const w of [overlayWin, subWin, dmWin, turnWin, win]) {
     if (!w || w.isDestroyed()) continue;
     try {
       // Windows 10 2004+：WDA_EXCLUDEFROMCAPTURE，窗口照常显示，只是截屏 / 录屏里看不到
@@ -2082,6 +2091,143 @@ function setDanmakuStyle(patch = {}) {
   return danmakuPublicState();
 }
 
+/* ------------------------------------------------------------ 转向提醒 */
+
+/**
+ * 博主左转 / 右转 / 掉头时在屏幕上弹一个提示（turn/index.html）。
+ * 判定在 turn-detect.js，输入就是红箭头那一路行进方向（overlay:bearing）。
+ * 窗口透明、鼠标穿透、置顶；位置可在启动器里「调整位置」拖动，记住。
+ */
+let turnWin = null;
+let turnEditing = false;
+const turnDetector = createTurnDetector({ minTurn: 60 });
+
+function turnBounds() {
+  const area = screen.getPrimaryDisplay().workArea;
+  const width = 340;
+  const height = 130;
+  const t = settings.turn;
+  let x = Number.isFinite(t.x) ? Math.round(t.x) : Math.round(area.x + (area.width - width) / 2);
+  let y = Number.isFinite(t.y) ? Math.round(t.y) : Math.round(area.y + area.height * 0.16);
+  const visible = screen.getAllDisplays().some((d) => {
+    const w = d.bounds;
+    return x + width > w.x + 40 && x < w.x + w.width - 40 && y + height > w.y + 20 && y < w.y + w.height - 20;
+  });
+  if (!visible) {
+    x = Math.round(area.x + (area.width - width) / 2);
+    y = Math.round(area.y + area.height * 0.16);
+  }
+  return { x, y, width, height };
+}
+
+function createTurnWindow() {
+  if (turnWin && !turnWin.isDestroyed()) return turnWin;
+  turnWin = new BrowserWindow({
+    ...turnBounds(),
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    focusable: false,
+    hasShadow: false,
+    show: false,
+    title: '转向提醒',
+    webPreferences: {
+      preload: path.join(__dirname, 'turn', 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false
+    }
+  });
+  turnWin.setAlwaysOnTop(true, 'screen-saver');
+  turnWin.setIgnoreMouseEvents(!turnEditing);
+  turnWin.setFocusable(turnEditing);
+  applyCaptureProtection();
+  turnWin.on('move', () => {
+    if (!turnWin || turnWin.isDestroyed()) return;
+    const b = turnWin.getBounds();
+    settings.turn.x = b.x;
+    settings.turn.y = b.y;
+    persist();
+  });
+  turnWin.on('closed', () => {
+    turnWin = null;
+    turnEditing = false;
+  });
+  turnWin.loadFile(path.join(__dirname, 'turn', 'index.html'));
+  turnWin.webContents.on('did-finish-load', () => {
+    if (turnWin && !turnWin.isDestroyed()) turnWin.webContents.send('turn:mode', turnEditing ? 'edit' : 'lock');
+  });
+  return turnWin;
+}
+
+function showTurnWindow() {
+  const w = createTurnWindow();
+  if (w.isVisible()) return w;
+  if (w.webContents.isLoading()) {
+    w.once('ready-to-show', () => {
+      if (!w.isDestroyed() && settings.turn.enabled) w.showInactive();
+    });
+  } else {
+    w.showInactive();
+  }
+  return w;
+}
+
+/** 红箭头的每一次更新都喂给转向检测；画面里没小地图时清空，免得两段不相干的方向被拼成一次「转弯」 */
+function onBearingForTurn(p) {
+  if (!settings.turn.enabled || !p) return;
+  if (typeof p.angle !== 'number') {
+    if (!p.hold) turnDetector.reset();
+    return;
+  }
+  if (p.hold) return; // 疑似反向的那一帧不算数
+  const ev = turnDetector.push(p.angle, Date.now());
+  if (ev && turnWin && !turnWin.isDestroyed() && !turnWin.webContents.isLoading()) {
+    if (!turnWin.isVisible()) turnWin.showInactive();
+    turnWin.webContents.send('turn:show', ev);
+  }
+}
+
+function setTurnEditing(on) {
+  const next = on === undefined || on === null ? !turnEditing : !!on;
+  if (next && !settings.turn.enabled) {
+    settings.turn.enabled = true;
+    persist();
+  }
+  turnEditing = next;
+  const w = next ? showTurnWindow() : turnWin;
+  if (w && !w.isDestroyed()) {
+    w.setIgnoreMouseEvents(!turnEditing);
+    w.setFocusable(turnEditing);
+    if (!w.webContents.isLoading()) w.webContents.send('turn:mode', turnEditing ? 'edit' : 'lock');
+  }
+  sendTo(consoleWin, 'turn:state', { enabled: !!settings.turn.enabled, editing: turnEditing });
+  return turnEditing;
+}
+
+function setTurnSettings(patch = {}) {
+  const t = settings.turn;
+  if (typeof patch.enabled === 'boolean') {
+    t.enabled = patch.enabled;
+    if (t.enabled) showTurnWindow();
+    else {
+      if (turnEditing) setTurnEditing(false);
+      if (turnWin && !turnWin.isDestroyed()) turnWin.hide();
+      turnDetector.reset();
+    }
+  }
+  if (Number.isFinite(patch.minTurn)) {
+    t.minTurn = Math.min(120, Math.max(30, Math.round(patch.minTurn)));
+    turnDetector.setMinTurn(t.minTurn);
+  }
+}
+
 /* -------------------------------------------------------------- 全局热键 */
 
 function sendPlayerAction(action) {
@@ -2469,7 +2615,9 @@ function registerIpc() {
   ipcMain.on('overlay:bearing', (_e, payload) => {
     lastBearing = payload;
     if (overlayWin && !overlayWin.isDestroyed()) overlayWin.webContents.send('bearing', payload);
+    onBearingForTurn(payload);
   });
+  ipcMain.handle('turn:edit', (_e, on) => setTurnEditing(on));
 
   ipcMain.handle('overlay:enable', (_e, on) => setBearingEnabled(on));
 
@@ -2660,6 +2808,7 @@ function registerIpc() {
     if (patch.clickThrough !== undefined) setPass(patch.clickThrough);
     if (patch.opacity !== undefined) setOpacity(patch.opacity);
     if (patch.hotkeys) settings.hotkeys = { ...settings.hotkeys, ...patch.hotkeys };
+    if (patch.turn && typeof patch.turn === 'object') setTurnSettings(patch.turn);
     if (patch.autoPause && typeof patch.autoPause === 'object') {
       const ap = patch.autoPause;
       if (typeof ap.enabled === 'boolean') settings.autoPause.enabled = ap.enabled;
@@ -2932,6 +3081,8 @@ if (!gotLock) {
     if (settings.bearing.enabled && win) showOverlay();
     if (settings.subtitle.enabled) showSubtitleWindow();
     if (settings.danmaku.enabled) showDanmakuWindow();
+    if (settings.turn.enabled) showTurnWindow();
+    turnDetector.setMinTurn(settings.turn.minTurn);
     // 换分辨率 / 插拔显示器：弹幕层要重新铺满主屏
     screen.on('display-metrics-changed', fitDanmakuWindow);
     screen.on('display-added', fitDanmakuWindow);

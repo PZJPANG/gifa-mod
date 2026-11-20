@@ -228,6 +228,23 @@
                   <span class="setting-text"><strong>显示博主的位置点</strong><small id="locateStatus">把视频里的小地图和你的小地图比对，在你的小地图上用黄点标出博主站在哪；只有你跟在路线附近时才会出现</small></span>
                   <span class="switch"><input type="checkbox" id="setLocate" /></span>
                 </label>
+                <label class="setting" for="setTurn">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-compass"></use></svg></span>
+                  <span class="setting-text"><strong>转向提醒</strong><small>博主左转 / 右转 / 掉头时，屏幕上弹出提示（看红箭头那一路行进方向，原地转镜头不算）</small></span>
+                  <span class="switch"><input type="checkbox" id="setTurn" /></span>
+                </label>
+                <div class="setting">
+                  <span class="setting-ico"><svg class="ico"><use href="#i-sliders"></use></svg></span>
+                  <span class="setting-text"><strong><label for="setTurnMin">转多少度才提醒</label></strong><small>越小越灵敏，但小拐弯也会提醒</small></span>
+                  <span class="setting-ctrl">
+                    <select id="setTurnMin" class="sel">
+                      <option value="45">45°（灵敏）</option>
+                      <option value="60">60°（推荐）</option>
+                      <option value="80">80°（只提醒大转弯）</option>
+                    </select>
+                    <button id="btnTurnMove" class="small">调整位置</button>
+                  </span>
+                </div>
 
                 <!-- 主流程只有两步，单独做成大按钮；排查工具降一级放在下面 -->
                 <div class="setting setting-stack">

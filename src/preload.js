@@ -18,6 +18,9 @@ contextBridge.exposeInMainWorld('api', {
   // 视频角色定位：博主小地图切片（每秒约 4 次，单向 send）
   minimapPatch: (payload) => ipcRenderer.send('locate:patch', payload),
   locateDiag: (payload) => ipcRenderer.send('locate:diag', payload),
+  // 转向提醒：调整位置 / 锁定（不传参数即切换）
+  turnEdit: (on) => ipcRenderer.invoke('turn:edit', on),
+  onTurnState: (cb) => ipcRenderer.on('turn:state', (_e, s) => cb(s)),
   locateState: () => ipcRenderer.invoke('locate:state'),
   onLocateState: (cb) => ipcRenderer.on('locate:state', (_e, s) => cb(s)),
   overlayEnable: (on) => ipcRenderer.invoke('overlay:enable', on),

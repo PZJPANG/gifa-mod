@@ -89,6 +89,16 @@ function setTarget(key, deg) {
   if (!t.raf) t.raf = requestAnimationFrame(() => step(key));
 }
 
+function hideArrow() {
+  const t = tween.arrow;
+  if (t.raf) cancelAnimationFrame(t.raf);
+  t.raf = 0;
+  if (t.shown === null && t.target === null) return;
+  t.shown = null;
+  t.target = null;
+  draw();
+}
+
 function resize() {
   const dpr = window.devicePixelRatio || 1;
   const w = window.innerWidth;
@@ -347,7 +357,7 @@ function drawLocateDot(cx, cy, r, dot) {
   const y = cy + oy;
   const size = clamp(r * 0.075, 4, 10);
   ctx.save();
-  ctx.globalAlpha = dot.held ? 0.45 : 1;
+  // 始终实心：以前「沿用上一帧」时画淡一半，看起来像一闪一闪的
   // 从你（圆心外一点）到博主的一条细虚线：一眼看出「往哪走」
   if (dist > size * 3) {
     const ux = ox / dist;
@@ -504,6 +514,10 @@ window.overlayApi.onBearing((payload) => {
   // 箭头：hold 表示这一帧的判据是「疑似反向」，保持原角度不动，不要跟着转
   if (!payload.hold && typeof payload.angle === 'number') {
     setTarget('arrow', payload.angle);
+  } else if (payload.angle === null && !payload.hold) {
+    // 视频画面里已经连续 1 秒没有小地图（转场 / 过场 / 菜单）：红箭头收起来，
+    // 别挂着一个过期的方向。小地图回来后下一帧直接就位
+    hideArrow();
   }
 
   // 视角：可能是 null（这一帧没识别到扇形）。
